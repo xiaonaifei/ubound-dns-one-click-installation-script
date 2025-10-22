@@ -1,278 +1,88 @@
-#!/usr/bin/env bash
-set -euo pipefail
+sudo cp /etc/sysctl.conf /etc/sysctl.conf.bk_$(date +%Y%m%d_%H%M%S) && sudo sh -c 'echo "kernel.pid_max = 4194304
+kernel.panic = 1
+kernel.sysrq = 1
+kernel.core_pattern = core_%e
+kernel.printk = 3 4 1 3
+kernel.numa_balancing = 0
+kernel.sched_autogroup_enabled = 0
 
-# unified-network-opt.sh
-# 统一网络数据优化脚本（可直接运行）
-# - 计算并分配"网络内存"的比例（默认 60% 系统内存）
-# - 为 TCP/UDP 设置合理缓冲与上限（带最小保护与上限）
-# - 启用 BBR（若内核支持）
-# - 写入 /etc/sysctl.d/99-unified-network.conf 并立即生效
-# 兼容: Debian / Ubuntu / CentOS
+vm.swappiness = 1
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.panic_on_oom = 1
+vm.overcommit_memory = 1
+vm.min_free_kbytes = 65536
+vm.vfs_cache_pressure = 50
+vm.dirty_writeback_centisecs = 6000
+vm.dirty_expire_centisecs = 30000
 
-# ==== 配置（如需修改请在此处调整） ====
-NETWORK_MEM_PERCENT=60        # 网络内存占系统内存百分比（TCP+UDP 合并使用）
-BUFFER_PORTION_PERCENT=70     # 在网络内存中，用于缓冲区的比例（其余用于内核/系统）
-TCP_PORTION_PERCENT=70        # 缓冲区中 TCP 所占比例（其余为 UDP）
-MIN_TCP_MEM_PAGES=512         # tcp_mem 最小页数（每页 4KB）
-MAX_RMEM_WMEM_BYTES=16777216  # rmem/wmem 最大值上限 (16MB)
-SYSCTL_CONF="/etc/sysctl.d/99-unified-network.conf"
-LIMITS_FILE="/etc/security/limits.d/99-unified-network.conf"
-
-# ==== 颜色/日志 ====
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-log() { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err() { echo -e "${RED}[ERROR]${NC} $*"; }
-
-# ==== check root ====
-if [ "$(id -u)" -ne 0 ]; then
-  err "请以 root 用户运行此脚本（sudo）"
-  exit 1
-fi
-
-# ==== 询问确认 ====
-echo
-echo "=========================================================="
-echo "  统一网络数据优化脚本"
-echo "  - TCP/UDP 共享网络内存: ${NETWORK_MEM_PERCENT}% 系统内存"
-echo "  - 70% 网络内存用于缓冲（TCP ${TCP_PORTION_PERCENT}% / UDP 其余）"
-echo "  配置将写入: ${SYSCTL_CONF}"
-echo "=========================================================="
-echo
-read -p "您确定要继续并应用到系统吗？(y/N): " CONF
-if [[ "${CONF,,}" != "y" ]]; then
-  log "已取消。"
-  exit 0
-fi
-
-# ==== helper: safe_number ====
-safe_int() {
-  printf '%d' "${1}" 2>/dev/null || echo 0
-}
-
-# ==== 读取总内存（KB）并计算 ====
-TOTAL_MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-if [ -z "$TOTAL_MEM_KB" ]; then
-  err "无法读取 /proc/meminfo"
-  exit 1
-fi
-TOTAL_MEM_MB=$((TOTAL_MEM_KB/1024))
-
-log "系统内存: ${TOTAL_MEM_MB} MB (${TOTAL_MEM_KB} KB)"
-
-# 计算网络内存（KB）
-NETWORK_MEM_KB=$(( TOTAL_MEM_KB * NETWORK_MEM_PERCENT / 100 ))
-BUFFER_SIZE_KB=$(( NETWORK_MEM_KB * BUFFER_PORTION_PERCENT / 100 ))
-TCP_BUFFER_KB=$(( BUFFER_SIZE_KB * TCP_PORTION_PERCENT / 100 / 100 * 100 )) # avoid float issue
-# formula simplified: TCP_BUFFER_KB = BUFFER_SIZE_KB * TCP_PORTION_PERCENT / 100
-TCP_BUFFER_KB=$(( BUFFER_SIZE_KB * TCP_PORTION_PERCENT / 100 ))
-UDP_BUFFER_KB=$(( BUFFER_SIZE_KB - TCP_BUFFER_KB ))
-
-# tcp_mem expects "pages" (4KB)
-NETWORK_MEM_MIN_PAGES=$(( NETWORK_MEM_KB * 40 / 100 / 4 ))      # 40% of network mem -> min
-NETWORK_MEM_PRESSURE_PAGES=$(( NETWORK_MEM_KB * 50 / 100 / 4 )) # 50% -> pressure
-NETWORK_MEM_MAX_PAGES=$(( NETWORK_MEM_KB * 60 / 100 / 4 ))      # 60% -> max
-
-# 最小保护（防止小内存机数值太小）
-if [ "$NETWORK_MEM_MIN_PAGES" -lt "$MIN_TCP_MEM_PAGES" ]; then
-  warn "检测到 tcp_mem 最小页数过小 (${NETWORK_MEM_MIN_PAGES}), 调整到 ${MIN_TCP_MEM_PAGES}"
-  NETWORK_MEM_MIN_PAGES=$MIN_TCP_MEM_PAGES
-fi
-if [ "$NETWORK_MEM_PRESSURE_PAGES" -lt $((MIN_TCP_MEM_PAGES*2)) ]; then
-  NETWORK_MEM_PRESSURE_PAGES=$((MIN_TCP_MEM_PAGES*2))
-fi
-if [ "$NETWORK_MEM_MAX_PAGES" -lt $((MIN_TCP_MEM_PAGES*4)) ]; then
-  NETWORK_MEM_MAX_PAGES=$((MIN_TCP_MEM_PAGES*4))
-fi
-
-# 计算 rmem/wmem 值（以 bytes 表示），并加上上限保护
-# 我们把 core_max_buffer 设置为 buffer_size_kb 的 50%（以内核使用 & TCP/UDP 共享）
-CORE_MAX_BYTES=$(( BUFFER_SIZE_KB * 1024 / 2 ))
-if [ "$CORE_MAX_BYTES" -gt "$MAX_RMEM_WMEM_BYTES" ]; then
-  CORE_MAX_BYTES=$MAX_RMEM_WMEM_BYTES
-fi
-CORE_DEFAULT_BYTES=$(( CORE_MAX_BYTES / 4 ))
-
-# TCP 最大缓冲（bytes）: 使用 TCP_BUFFER_KB 的一半作为单连接上限，且不超过 CORE_MAX_BYTES
-TCP_MAX_BYTES=$(( TCP_BUFFER_KB * 1024 / 2 ))
-if [ "$TCP_MAX_BYTES" -gt "$CORE_MAX_BYTES" ]; then
-  TCP_MAX_BYTES=$CORE_MAX_BYTES
-fi
-if [ "$TCP_MAX_BYTES" -lt 262144 ]; then
-  TCP_MAX_BYTES=262144
-fi
-
-# UDP 最小缓冲（bytes）
-UDP_MIN_BYTES=$(( UDP_BUFFER_KB * 1024 / 8 ))
-if [ "$UDP_MIN_BYTES" -lt 8192 ]; then
-  UDP_MIN_BYTES=8192
-fi
-
-# 显示计算结果
-log "计算结果: 网络内存 ${NETWORK_MEM_KB} KB (~$((NETWORK_MEM_KB/1024)) MB)"
-log "  buffer_size_kb = ${BUFFER_SIZE_KB} KB (~$((BUFFER_SIZE_KB/1024)) MB)"
-log "  tcp_buffer_kb   = ${TCP_BUFFER_KB} KB"
-log "  udp_buffer_kb   = ${UDP_BUFFER_KB} KB"
-log "  tcp_mem pages: min=${NETWORK_MEM_MIN_PAGES} pressure=${NETWORK_MEM_PRESSURE_PAGES} max=${NETWORK_MEM_MAX_PAGES}"
-log "  core rmem/wmem max = ${CORE_MAX_BYTES} bytes, default = ${CORE_DEFAULT_BYTES} bytes"
-log "  tcp_rmem max per-socket = ${TCP_MAX_BYTES} bytes"
-log "  udp_rmem_min/wmem_min = ${UDP_MIN_BYTES} bytes"
-
-# ==== 检测 BBR 支持（支持 tcp_bbr/tcp_bbr2/tcp_bbr3） ====
-if grep -Eq "tcp_bbr|tcp_bbr2|tcp_bbr3" /proc/modules; then
-  BBR_LOADED=1
-else
-  BBR_LOADED=0
-fi
-
-# ==== 备份老 sysctl 文件（如果存在） ====
-if [ -f "${SYSCTL_CONF}" ]; then
-  cp "${SYSCTL_CONF}" "${SYSCTL_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  log "已备份原有 ${SYSCTL_CONF}"
-fi
-
-# 备份全局 sysctl.conf（保守）
-if [ -f /etc/sysctl.conf ]; then
-  cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)
-fi
-
-# ==== 生成 sysctl 配置文件 ====
-cat > "${SYSCTL_CONF}" <<EOF
-# 统一网络数据优化配置 - 生成于 $(date)
-# 目标: TCP/UDP 共享网络内存 ${NETWORK_MEM_PERCENT}% 系统内存
-# 说明: 已包含保护和上限，推荐写入 /etc/sysctl.d/99-unified-network.conf
-
-# 调度与拥塞控制
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 若需在专用可信网络打开 ECN, 将 tcp_ecn 改为 1
-net.ipv4.tcp_ecn = 0
-
-# 禁用 IPv6 (如需启用请注释下一行)
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-
-# tcp_mem/udp_mem 以页(4KB)为单位
-net.ipv4.tcp_mem = ${NETWORK_MEM_MIN_PAGES} ${NETWORK_MEM_PRESSURE_PAGES} ${NETWORK_MEM_MAX_PAGES}
-net.ipv4.udp_mem = ${NETWORK_MEM_MIN_PAGES} ${NETWORK_MEM_PRESSURE_PAGES} ${NETWORK_MEM_MAX_PAGES}
-
-# TCP rmem/wmem (bytes)
-net.ipv4.tcp_rmem = 4096 87380 ${TCP_MAX_BYTES}
-net.ipv4.tcp_wmem = 4096 65536 ${TCP_MAX_BYTES}
-
-# UDP min buffers
-net.ipv4.udp_rmem_min = ${UDP_MIN_BYTES}
-net.ipv4.udp_wmem_min = ${UDP_MIN_BYTES}
-
-# core r/w buffer
-net.core.rmem_max = ${CORE_MAX_BYTES}
-net.core.wmem_max = ${CORE_MAX_BYTES}
-net.core.rmem_default = ${CORE_DEFAULT_BYTES}
-net.core.wmem_default = ${CORE_DEFAULT_BYTES}
-
-# 连接与队列
-net.ipv4.tcp_max_syn_backlog = 65536
-net.core.somaxconn = 131072
 net.core.netdev_max_backlog = 300000
-
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_max_orphans = 262144
-
-# 保守: 关闭低延迟优化以保证吞吐
-net.ipv4.tcp_low_latency = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_adv_win_scale = 1
-
-# 重传与 keepalive
-net.ipv4.tcp_retries1 = 2
-net.ipv4.tcp_retries2 = 12
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_keepalive_intvl = 15
-
-# 系统资源
-fs.file-max = 4194304
-fs.nr_open = 4194304
-net.ipv4.ip_local_port_range = 10000 65535
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.somaxconn = 65536
 net.core.optmem_max = 4194304
 net.core.netdev_budget = 600
 net.core.netdev_budget_usecs = 6000
 
-# 路由和邻居缓存
-net.ipv4.route.max_size = 262144
-net.ipv4.neigh.default.gc_thresh1 = 4096
-net.ipv4.neigh.default.gc_thresh2 = 16384
-net.ipv4.neigh.default.gc_thresh3 = 32768
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 5
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_dsack = 1
 
-# UDP 特殊
-net.ipv4.udp_l3mdev_accept = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-EOF
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_ecn = 1
 
-log "已写入 ${SYSCTL_CONF}"
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_orphans = 262144
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_abort_on_overflow = 0
+net.ipv4.tcp_stdurg = 0
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_syncookies = 1
 
-# ==== 尝试加载 BBR 模块（若未加载） ====
-if [ "$BBR_LOADED" -eq 0 ]; then
-  log "尝试加载 BBR 模块 tcp_bbr ..."
-  if modprobe tcp_bbr 2>/dev/null; then
-    log "tcp_bbr 模块加载成功"
-  else
-    warn "无法加载 tcp_bbr 模块（可能内核不支持）。配置仍已写入，但 BBR 可能无法启用。"
-  fi
-else
-  log "检测到已加载的 BBR 模块"
-fi
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.route.gc_timeout = 100
+net.ipv4.neigh.default.gc_stale_time = 120
+net.ipv4.neigh.default.gc_thresh3 = 8192
+net.ipv4.neigh.default.gc_thresh2 = 4096
+net.ipv4.neigh.default.gc_thresh1 = 2048
 
-# ==== 应用配置 ====
-log "应用 sysctl 配置 (sysctl --system)..."
-if sysctl --system >/dev/null 2>&1; then
-  log "sysctl 配置应用成功"
-else
-  warn "sysctl 应用返回非零（请检查 /var/log/syslog 或 journalctl 以查看错误）"
-fi
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.default.arp_announce = 2
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.default.arp_ignore = 1
 
-# ==== 验证 BBR 是否为当前拥塞算法 ====
-CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control || echo "unknown")
-if echo "$CUR_CC" | grep -q "bbr"; then
-  log "当前拥塞控制: ${CUR_CC} (BBR 已启用)"
-else
-  warn "当前拥塞控制: ${CUR_CC} (BBR 未启用或内核不支持)"
-fi
+# 文件系统优化
+fs.file-max = 4194304
+fs.nr_open = 4194304
+fs.suid_dumpable = 0
 
-# ==== 保存系统 limits（非破坏性，使用 /etc/security/limits.d） ====
-cat > "${LIMITS_FILE}" <<EOF
-# 统一网络优化资源限制 - 生成于 $(date)
-* soft nofile 1048576
-* hard nofile 1048576
-* soft nproc 524288
-* hard nproc 524288
-root soft nofile 1048576
-root hard nofile 1048576
-root soft nproc 524288
-root hard nproc 524288
-EOF
-log "已写入 ${LIMITS_FILE}（登录会话可能需重新登录以生效）"
-
-# ==== 最终状态显示 ====
-echo
-log "当前关键参数（即时读取）:"
-echo "  net.core.default_qdisc = $(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
-echo "  net.ipv4.tcp_congestion_control = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
-echo "  net.ipv4.tcp_mem = $(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo N/A)"
-echo "  net.core.rmem_max = $(sysctl -n net.core.rmem_max 2>/dev/null || echo N/A)"
-echo "  net.ipv4.tcp_rmem = $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo N/A)"
-echo "  net.ipv4.udp_rmem_min = $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo N/A)"
-
-log "完成：统一网络优化已应用。请根据服务实际运行状况（如高延迟/丢包/连接失败）做回滚或微调。"
-log "若需回滚，请恢复备份的 sysctl 文件，或删除 ${SYSCTL_CONF} 并运行: sysctl --system"
-
-exit 0
+# 内存管理
+vm.zone_reclaim_mode = 0
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.swappiness = 1
+" > /etc/sysctl.conf' && sudo sysctl -p
