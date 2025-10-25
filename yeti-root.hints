@@ -1,0 +1,41 @@
+; 雪人计划IPv6根服务器根提示文件
+; 包含完整域名和IPv6地址的根服务器记录
+; 格式标准，可直接用于DNS服务器配置
+;
+.                       3600000  NS    bii.dns-lab.net.
+bii.dns-lab.net.        3600000  AAAA  240c:f:1:22::6
+;
+.                       3600000  NS    yeti-ns.wide.ad.jp.
+yeti-ns.wide.ad.jp.     3600000  AAAA  2001:200:1d9::35
+;
+.                       3600000  NS    yeti-ns.tisf.net.
+yeti-ns.tisf.net.       3600000  AAAA  2001:4f8:3:1006::1:4
+;
+.                       3600000  NS    ns-yeti.bonsid.org.
+ns-yeti.bonsid.org.     3600000  AAAA  2a02:2810:0:405::250
+;
+.                       3600000  NS    yeti-ns.ix.ru.
+yeti-ns.ix.ru.          3600000  AAAA  2001:6d0:6d06::53
+;
+.                       3600000  NS    yeti-dns01.dnsworkshop.org.
+yeti-dns01.dnsworkshop.org. 3600000 AAAA 2a03:4000:5:2c3::53
+;
+.                       3600000  NS    dahu2.yeti.eu.org.
+dahu2.yeti.eu.org.      3600000  AAAA  2001:67c:217c:6::2
+;
+.                       3600000  NS    yeti.aquaray.com.
+yeti.aquaray.com.       3600000  AAAA  2a02:ec0:200::1
+;
+.                       3600000  NS    yeti-ns.switch.ch.
+yeti-ns.switch.ch.      3600000  AAAA  2001:620:0:ff::29
+;
+.                       3600000  NS    yeti-ns1.dns-lab.net.
+yeti-ns1.dns-lab.net.   3600000  AAAA  240e:eb:8001:e01::53
+;
+.                       3600000  NS    yeti-ns2.dns-lab.net.
+yeti-ns2.dns-lab.net.   3600000  AAAA  2001:da8:268:4200::6
+;
+.                       3600000  NS    yeti-ns3.dns-lab.net.
+yeti-ns3.dns-lab.net.   3600000  AAAA  240e:97c:38:201::44
+;
+; 雪人计划IPv6根提示文件结束
