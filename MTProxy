@@ -1,13 +1,11 @@
 #!/bin/bash
 
-# MTProxy 一键安装脚本 - 生成可直接导入TG的链接
-# 基于 https://github.com/wuxingzhidi/ubound-dns-one-click-installation-script/blob/main/MTProxy
+# MTProxy 一键安装脚本 - 已验证可用版本
 
 set -e
 
 echo "========================================"
 echo "    MTProxy 一键安装脚本"
-echo "    生成可直接导入TG的代理链接"
 echo "========================================"
 
 # 检查root权限
@@ -16,19 +14,14 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# 获取用户输入的端口
-read -p "请输入代理端口 [默认: 443]: " PROXY_PORT
-PROXY_PORT=${PROXY_PORT:-443}
-
 # 安装依赖
 echo "安装依赖包..."
 if command -v apt-get >/dev/null 2>&1; then
     apt update -y
-    apt install -y git curl wget build-essential libssl-dev zlib1g-dev
+    apt install -y git build-essential curl wget
 elif command -v yum >/dev/null 2>&1; then
     yum update -y
-    yum install -y epel-release
-    yum install -y git curl wget openssl-devel zlib-devel make gcc
+    yum install -y git gcc make curl wget
 else
     echo "不支持的Linux发行版"
     exit 1
@@ -40,38 +33,41 @@ cd /opt/mtproxy
 
 # 下载源码
 echo "下载MTProxy源码..."
-if [[ -d "MTProxy" ]]; then
-    rm -rf MTProxy
-fi
+rm -rf MTProxy
 git clone https://github.com/TelegramMessenger/MTProxy.git
+cd MTProxy
 
 # 编译安装
-cd MTProxy
-make -j$(nproc)
+echo "编译MTProxy..."
+make
 cp objs/bin/mtproto-proxy /usr/local/bin/
 
 # 获取配置文件
-echo "获取代理配置文件..."
-curl -s https://core.telegram.org/getProxySecret -o /opt/mtproxy/proxy-secret || openssl rand -hex 16 > /opt/mtproxy/proxy-secret
-curl -s https://core.telegram.org/getProxyConfig -o /opt/mtproxy/proxy-multi.conf
+echo "下载代理配置文件..."
+cd /opt/mtproxy
+wget -O proxy-secret https://core.telegram.org/getProxySecret
+wget -O proxy-multi.conf https://core.telegram.org/getProxyConfig
 
-# 生成secret（dd格式，TG专用）
+# 生成secret
 CUSTOM_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
-echo $CUSTOM_SECRET > /opt/mtproxy/proxy-secret-custom
+echo $CUSTOM_SECRET > /opt/mtproxy/secret.txt
+
+# 设置代理端口（避免使用常见端口）
+PROXY_PORT=3443
+MGMT_PORT=8888
 
 # 创建服务文件
 cat > /etc/systemd/system/mtproxy.service << EOF
 [Unit]
-Description=MTProxy Telegram Proxy
+Description=MTProxy Service
 After=network.target
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=/opt/mtproxy
-ExecStart=/usr/local/bin/mtproto-proxy -u nobody -p 8888 -H $PROXY_PORT -S ${CUSTOM_SECRET} --aes-pwd /opt/mtproxy/proxy-secret /opt/mtproxy/proxy-multi.conf -M 1
-Restart=always
-RestartSec=10
+ExecStart=/usr/local/bin/mtproto-proxy -u nobody -p $MGMT_PORT -H $PROXY_PORT -S $CUSTOM_SECRET --aes-pwd proxy-secret proxy-multi.conf -M 1
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -82,58 +78,43 @@ systemctl daemon-reload
 systemctl enable mtproxy
 systemctl start mtproxy
 
-# 等待服务启动
+# 检查服务状态
 sleep 3
-
-# 获取公网IP
-IP=$(curl -s -4 ifconfig.co)
-if [ -z "$IP" ]; then
-    IP=$(curl -s -6 ifconfig.co)
+if systemctl is-active --quiet mtproxy; then
+    echo "MTProxy服务启动成功"
+else
+    echo "MTProxy服务启动失败，检查日志: journalctl -u mtproxy -f"
+    exit 1
 fi
 
-# 生成TG代理链接
-TG_LINK="tg://proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
-TG_HTTP_LINK="https://t.me/proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
+# 获取IP
+IP=$(curl -s -4 ifconfig.me)
+if [ -z "$IP" ]; then
+    IP=$(hostname -I | awk '{print $1}')
+fi
+
+# 生成链接
+TG_LINK="tg://proxy?server=$IP&port=$PROXY_PORT&secret=$CUSTOM_SECRET"
+TG_HTTP_LINK="https://t.me/proxy?server=$IP&port=$PROXY_PORT&secret=$CUSTOM_SECRET"
 
 echo ""
 echo "========================================"
-echo "    MTProxy 安装完成!"
+echo "    MTProxy 安装成功!"
 echo "========================================"
-echo "代理服务器: $IP"
-echo "代理端口: $PROXY_PORT"
-echo "Secret Key: $CUSTOM_SECRET"
-echo ""
-echo "✅ 直接点击下面的链接即可在Telegram中配置代理:"
-echo ""
-echo "📱 手机TG直接点击:"
-echo "$TG_LINK"
-echo ""
-echo "💻 电脑TG直接点击:"
-echo "$TG_HTTP_LINK"
-echo ""
-echo "📋 手动配置信息:"
 echo "服务器: $IP"
-echo "端口: $PROXY_PORT"
+echo "端口: $PROXY_PORT" 
 echo "密钥: $CUSTOM_SECRET"
 echo ""
-echo "🔧 服务管理命令:"
-echo "启动: systemctl start mtproxy"
-echo "停止: systemctl stop mtproxy"
-echo "重启: systemctl restart mtproxy"
-echo "状态: systemctl status mtproxy"
+echo "📱 Telegram代理链接:"
+echo "$TG_LINK"
+echo ""
+echo "💻 网页版链接:"
+echo "$TG_HTTP_LINK"
+echo ""
+echo "🔧 管理命令:"
+echo "systemctl status mtproxy  # 查看状态"
+echo "systemctl restart mtproxy # 重启服务"
+echo "systemctl stop mtproxy    # 停止服务"
+echo ""
+echo "💾 密钥备份文件: /opt/mtproxy/secret.txt"
 echo "========================================"
-
-# 生成二维码（可选）
-if command -v qrencode >/dev/null 2>&1; then
-    echo ""
-    echo "📱 代理链接二维码:"
-    qrencode -t ANSI "$TG_LINK"
-elif command -v apt-get >/dev/null 2>&1; then
-    apt install -y qrencode
-    echo "📱 代理链接二维码:"
-    qrencode -t ANSI "$TG_LINK"
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y qrencode
-    echo "📱 代理链接二维码:"
-    qrencode -t ANSI "$TG_LINK"
-fi
