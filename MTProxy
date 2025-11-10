@@ -9,6 +9,7 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 # 日志函数
@@ -22,6 +23,10 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $1"
 }
 
 # 检查端口是否被占用
@@ -46,6 +51,10 @@ check_port() {
 
 # 获取用户输入
 get_user_input() {
+    echo "================================"
+    echo "    MTProxy 安装配置"
+    echo "================================"
+    
     # 获取代理端口
     while true; do
         read -p "请输入MTProxy代理端口 [默认: 443]: " PROXY_PORT
@@ -129,6 +138,8 @@ install_dependencies() {
             apt install -y git curl wget build-essential libssl-dev zlib1g-dev
             ;;
     esac
+    
+    log_info "依赖包安装完成"
 }
 
 # 安装MTProxy
@@ -139,15 +150,23 @@ install_mtproxy() {
     mkdir -p /opt/mtproxy
     cd /opt/mtproxy
     
-    # 下载源码
-    if [[ ! -d "MTProxy" ]]; then
-        git clone https://github.com/TelegramMessenger/MTProxy.git
+    # 清理旧安装
+    if [[ -d "MTProxy" ]]; then
+        log_warn "检测到旧版MTProxy，正在清理..."
+        rm -rf MTProxy
     fi
+    
+    # 下载源码
+    log_info "下载MTProxy源码..."
+    git clone https://github.com/TelegramMessenger/MTProxy.git
     
     cd MTProxy
     
     # 编译安装
+    log_info "编译MTProxy..."
     make
+    
+    # 复制二进制文件
     cp objs/bin/mtproto-proxy /usr/local/bin/
     
     log_info "MTProxy编译安装完成"
@@ -157,16 +176,21 @@ install_mtproxy() {
 generate_config() {
     log_info "生成配置文件..."
     
+    cd /opt/mtproxy
+    
     # 获取Telegram代理secret
     log_info "从Telegram获取代理secret..."
-    curl -s https://core.telegram.org/getProxySecret -o /opt/mtproxy/proxy-secret || {
+    if ! curl -s https://core.telegram.org/getProxySecret -o /opt/mtproxy/proxy-secret; then
         log_warn "无法从Telegram获取代理secret，使用本地生成"
         openssl rand -hex 16 > /opt/mtproxy/proxy-secret
-    }
+    fi
     
     # 获取Telegram代理配置
     log_info "从Telegram获取代理配置..."
-    curl -s https://core.telegram.org/getProxyConfig -o /opt/mtproxy/proxy-multi.conf
+    if ! curl -s https://core.telegram.org/getProxyConfig -o /opt/mtproxy/proxy-multi.conf; then
+        log_error "无法获取代理配置，安装失败"
+        exit 1
+    fi
     
     # 生成自定义secret
     CUSTOM_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
@@ -178,6 +202,17 @@ generate_config() {
 # 配置服务
 setup_service() {
     log_info "配置系统服务..."
+    
+    # 停止旧服务（如果存在）
+    if systemctl is-active --quiet mtproxy; then
+        log_info "停止运行中的MTProxy服务..."
+        systemctl stop mtproxy
+    fi
+    
+    if systemctl is-enabled --quiet mtproxy; then
+        log_info "禁用旧MTProxy服务..."
+        systemctl disable mtproxy
+    fi
     
     # 创建服务文件
     cat > /etc/systemd/system/mtproxy.service << EOF
@@ -192,6 +227,8 @@ WorkingDirectory=/opt/mtproxy
 ExecStart=/usr/local/bin/mtproto-proxy -u nobody -p $MGMT_PORT -H $PROXY_PORT -S ${CUSTOM_SECRET} --aes-pwd /opt/mtproxy/proxy-secret /opt/mtproxy/proxy-multi.conf -M 1
 Restart=always
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -206,13 +243,16 @@ EOF
 
 # 显示安装信息
 show_info() {
-    log_info "MTProxy安装完成！"
+    echo ""
     echo "================================"
-    echo "代理地址: $(curl -s -4 ifconfig.co)"
-    echo "代理端口: $PROXY_PORT"
-    echo "Secret: $CUSTOM_SECRET"
-    echo "管理端口: $MGMT_PORT"
+    echo "      MTProxy 安装完成"
     echo "================================"
+    log_info "代理地址: $(curl -s -4 ifconfig.co)"
+    log_info "代理端口: $PROXY_PORT"
+    log_info "Secret: $CUSTOM_SECRET"
+    log_info "管理端口: $MGMT_PORT"
+    echo "================================"
+    echo "服务管理命令:"
     echo "启动服务: systemctl start mtproxy"
     echo "停止服务: systemctl stop mtproxy"
     echo "重启服务: systemctl restart mtproxy"
@@ -224,9 +264,21 @@ show_info() {
     IP=$(curl -s -4 ifconfig.co)
     echo "Telegram代理链接:"
     echo "tg://proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
+    echo ""
+    echo "或使用以下格式:"
+    echo "https://t.me/proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
     echo "================================"
     log_info "安装完成！"
 }
+
+# 清理函数（用于异常退出）
+cleanup() {
+    log_error "安装过程中出现错误，正在清理..."
+    exit 1
+}
+
+# 设置异常处理
+trap cleanup ERR
 
 # 主函数
 main() {
@@ -242,10 +294,41 @@ main() {
     
     # 启动服务
     log_info "启动MTProxy服务..."
-    systemctl start mtproxy
+    if systemctl start mtproxy; then
+        log_info "MTProxy服务启动成功"
+    else
+        log_error "MTProxy服务启动失败"
+        journalctl -u mtproxy --no-pager -l
+        exit 1
+    fi
     
-    show_info
+    # 等待服务启动
+    sleep 2
+    
+    # 检查服务状态
+    if systemctl is-active --quiet mtproxy; then
+        show_info
+    else
+        log_error "MTProxy服务未正常运行"
+        journalctl -u mtproxy --no-pager -l
+        exit 1
+    fi
 }
+
+# 显示欢迎信息
+echo "================================"
+echo "    MTProxy 一键安装脚本"
+echo "================================"
+echo "支持系统: CentOS 7+, Ubuntu 16.04+, Debian 9+"
+echo "作者: 基于用户需求定制"
+echo ""
+
+# 确认是否继续
+read -p "是否继续安装? (y/N): " confirm
+if [[ ! $confirm =~ ^[Yy]$ ]]; then
+    echo "安装已取消"
+    exit 0
+fi
 
 # 执行主函数
 main "$@"
