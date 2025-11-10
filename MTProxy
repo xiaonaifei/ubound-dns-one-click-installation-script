@@ -1,224 +1,112 @@
 #!/bin/bash
 
-# MTProxy 官方版一键安装脚本（自定义端口和用户名）
+# MTProxy 官方标准安装脚本
 # 基于 https://github.com/TelegramMessenger/MTProxy
 
 set -e
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+echo "========================================"
+echo "    MTProxy 官方标准安装脚本"
+echo "========================================"
 
-# 日志函数
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# 检查root权限
+if [[ $EUID -ne 0 ]]; then
+    echo "错误: 请使用root权限运行此脚本"
+    exit 1
+fi
+
+# 安装依赖
+echo "步骤1: 安装依赖..."
+if command -v apt-get >/dev/null 2>&1; then
+    apt update -y
+    apt install -y git build-essential curl wget
+elif command -v yum >/dev/null 2>&1; then
+    yum update -y
+    yum install -y git gcc make curl wget
+fi
+
+# 创建工作目录
+mkdir -p /opt/mtproxy
+cd /opt/mtproxy
+
+# 下载源码
+echo "步骤2: 下载MTProxy源码..."
+rm -rf MTProxy
+git clone https://github.com/TelegramMessenger/MTProxy.git
+cd MTProxy
+
+# 编译
+echo "步骤3: 编译MTProxy..."
+make -j$(nproc)
+cp objs/bin/mtproto-proxy /usr/local/bin/
+
+# 获取官方配置文件
+echo "步骤4: 获取官方配置文件..."
+cd /opt/mtproxy
+wget -q -O proxy-secret https://core.telegram.org/getProxySecret
+wget -q -O proxy-multi.conf https://core.telegram.org/getProxyConfig
+
+# 检查文件是否下载成功
+if [[ ! -f "proxy-secret" ]] || [[ ! -s "proxy-secret" ]]; then
+    echo "错误: 无法下载 proxy-secret"
+    exit 1
+fi
+
+if [[ ! -f "proxy-multi.conf" ]] || [[ ! -s "proxy-multi.conf" ]]; then
+    echo "错误: 无法下载 proxy-multi.conf"
+    exit 1
+fi
+
+# 生成secret (32位十六进制)
+echo "步骤5: 生成代理密钥..."
+SECRET=$(openssl rand -hex 16)
+echo "生成的密钥: $SECRET"
+echo $SECRET > /opt/mtproxy/secret.txt
+
+# 获取用户配置
+echo ""
+echo "配置MTProxy参数:"
+read -p "请输入运行用户 [默认: nobody]: " RUN_USER
+RUN_USER=${RUN_USER:-nobody}
+
+read -p "请输入客户端连接端口 [默认: 443]: " CLIENT_PORT
+CLIENT_PORT=${CLIENT_PORT:-443}
+
+read -p "请输入本地管理端口 [默认: 8888]: " LOCAL_PORT
+LOCAL_PORT=${LOCAL_PORT:-8888}
+
+read -p "请输入工作进程数 [默认: 1]: " WORKERS
+WORKERS=${WORKERS:-1}
 
 # 检查端口是否被占用
 check_port() {
-    if command -v netstat &> /dev/null; then
-        if netstat -tuln | grep ":$1 " > /dev/null; then
-            return 0  # 端口被占用
-        else
-            return 1  # 端口空闲
-        fi
-    elif command -v ss &> /dev/null; then
-        if ss -tuln | grep ":$1 " > /dev/null; then
-            return 0  # 端口被占用
-        else
-            return 1  # 端口空闲
-        fi
+    if ss -tuln | grep ":$1 " > /dev/null; then
+        return 0
     else
-        return 1  # 假设端口可用
+        return 1
     fi
 }
 
-# 检查用户是否存在
-check_user() {
-    if id "$1" &>/dev/null; then
-        return 0  # 用户存在
-    else
-        return 1  # 用户不存在
-    fi
-}
+if check_port $CLIENT_PORT; then
+    echo "警告: 端口 $CLIENT_PORT 已被占用，可能需要更换"
+fi
 
-# 获取用户配置
-get_user_config() {
-    echo "========================================"
-    echo "   MTProxy 配置"
-    echo "========================================"
-    
-    # 获取代理端口
-    while true; do
-        read -p "请输入代理端口 [默认: 443]: " PROXY_PORT
-        PROXY_PORT=${PROXY_PORT:-443}
-        
-        if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
-            log_error "端口号必须是1-65535之间的数字"
-            continue
-        fi
-        
-        if check_port $PROXY_PORT; then
-            log_warn "端口 $PROXY_PORT 已被占用，请选择其他端口"
-            continue
-        fi
-        
-        break
-    done
-    
-    # 获取管理端口
-    while true; do
-        read -p "请输入管理端口 [默认: 8888]: " MGMT_PORT
-        MGMT_PORT=${MGMT_PORT:-8888}
-        
-        if ! [[ "$MGMT_PORT" =~ ^[0-9]+$ ]] || [ "$MGMT_PORT" -lt 1 ] || [ "$MGMT_PORT" -gt 65535 ]; then
-            log_error "端口号必须是1-65535之间的数字"
-            continue
-        fi
-        
-        if [ "$MGMT_PORT" = "$PROXY_PORT" ]; then
-            log_error "管理端口不能与代理端口相同"
-            continue
-        fi
-        
-        if check_port $MGMT_PORT; then
-            log_warn "端口 $MGMT_PORT 已被占用，请选择其他端口"
-            continue
-        fi
-        
-        break
-    done
-    
-    # 获取运行用户
-    while true; do
-        read -p "请输入运行用户名 [默认: nobody]: " RUN_USER
-        RUN_USER=${RUN_USER:-nobody}
-        
-        if ! check_user "$RUN_USER"; then
-            log_warn "用户 $RUN_USER 不存在，将创建该用户"
-            if useradd -r -s /bin/false "$RUN_USER" 2>/dev/null; then
-                log_info "用户 $RUN_USER 创建成功"
-                break
-            else
-                log_error "无法创建用户 $RUN_USER，请选择其他用户"
-                continue
-            fi
-        else
-            break
-        fi
-    done
-    
-    log_info "配置完成: 代理端口=$PROXY_PORT, 管理端口=$MGMT_PORT, 运行用户=$RUN_USER"
-}
+if check_port $LOCAL_PORT; then
+    echo "警告: 端口 $LOCAL_PORT 已被占用，可能需要更换"
+fi
 
-# 检查root权限
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "请使用root权限运行此脚本"
-        exit 1
-    fi
-}
-
-# 检测系统
-detect_os() {
-    if [[ -f /etc/redhat-release ]]; then
-        OS="centos"
-    elif [[ -f /etc/debian_version ]]; then
-        OS="debian"
-    elif grep -Eqi "ubuntu|debian" /etc/issue; then
-        OS="ubuntu"
-    else
-        log_error "不支持的操作系统"
-        exit 1
-    fi
-    log_info "检测到操作系统: $OS"
-}
-
-# 安装依赖
-install_dependencies() {
-    log_info "安装依赖包..."
-    
-    case $OS in
-        centos)
-            yum update -y
-            yum install -y epel-release
-            yum install -y git gcc make curl wget openssl-devel zlib-devel
-            ;;
-        ubuntu|debian)
-            apt update -y
-            apt install -y git gcc make curl wget build-essential libssl-dev zlib1g-dev
-            ;;
-    esac
-}
-
-# 编译安装MTProxy
-compile_mtproxy() {
-    log_info "编译安装 MTProxy..."
-    
-    cd /tmp
-    rm -rf MTProxy
-    git clone https://github.com/TelegramMessenger/MTProxy.git
-    cd MTProxy
-    
-    make -j$(nproc)
-    
-    # 安装到系统路径
-    cp objs/bin/mtproto-proxy /usr/local/bin/
-    chmod +x /usr/local/bin/mtproto-proxy
-    
-    log_info "MTProxy 编译完成"
-}
-
-# 获取配置文件
-get_configs() {
-    log_info "下载配置文件..."
-    
-    mkdir -p /etc/mtproxy
-    cd /etc/mtproxy
-    
-    # 下载官方配置文件
-    if ! curl -s -o proxy-secret https://core.telegram.org/getProxySecret; then
-        log_warn "无法下载 proxy-secret，使用本地生成"
-        openssl rand -hex 16 > proxy-secret
-    fi
-    
-    if ! curl -s -o proxy-multi.conf https://core.telegram.org/getProxyConfig; then
-        log_error "无法下载 proxy-multi.conf"
-        exit 1
-    fi
-    
-    # 生成自定义secret (dd格式)
-    SECRET=$(openssl rand -hex 16)
-    echo "dd$SECRET" > secret.txt
-    
-    # 设置文件权限
-    chown -R $RUN_USER:$RUN_USER /etc/mtproxy/
-    chmod 600 /etc/mtproxy/secret.txt
-    
-    log_info "配置文件下载完成"
-}
-
-# 配置系统服务
-setup_service() {
-    log_info "配置系统服务..."
-    
-    # 读取secret
-    SECRET=$(cat /etc/mtproxy/secret.txt)
-    
-    # 创建服务文件
-    cat > /etc/systemd/system/mtproxy.service << EOF
+# 创建服务文件
+echo "步骤6: 创建系统服务..."
+cat > /etc/systemd/system/mtproxy.service << EOF
 [Unit]
 Description=MTProxy Telegram Proxy
 After=network.target
 
 [Service]
 Type=simple
-User=$RUN_USER
-WorkingDirectory=/etc/mtproxy
-ExecStart=/usr/local/bin/mtproto-proxy -u $RUN_USER -p $MGMT_PORT -H $PROXY_PORT -S $SECRET --aes-pwd proxy-secret proxy-multi.conf -M 1
+User=root
+WorkingDirectory=/opt/mtproxy
+ExecStart=/usr/local/bin/mtproto-proxy -u $RUN_USER -p $LOCAL_PORT -H $CLIENT_PORT -S $SECRET --aes-pwd proxy-secret proxy-multi.conf -M $WORKERS
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -228,138 +116,60 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    # 重新加载systemd
-    systemctl daemon-reload
-    systemctl enable mtproxy
-    
-    log_info "系统服务配置完成"
-}
+# 启动服务
+echo "步骤7: 启动服务..."
+systemctl daemon-reload
+systemctl enable mtproxy
+systemctl start mtproxy
 
-# 配置防火墙
-setup_firewall() {
-    log_info "配置防火墙..."
-    
-    case $OS in
-        centos)
-            if command -v firewall-cmd &> /dev/null; then
-                firewall-cmd --permanent --add-port=$PROXY_PORT/tcp
-                firewall-cmd --permanent --add-port=$MGMT_PORT/tcp
-                firewall-cmd --reload
-                log_info "防火墙已开放端口 $PROXY_PORT 和 $MGMT_PORT"
-            fi
-            ;;
-        ubuntu|debian)
-            if command -v ufw &> /dev/null && ufw status | grep -q "active"; then
-                ufw allow $PROXY_PORT/tcp
-                ufw allow $MGMT_PORT/tcp
-                log_info "防火墙已开放端口 $PROXY_PORT 和 $MGMT_PORT"
-            fi
-            ;;
-    esac
-}
+# 检查服务状态
+echo "步骤8: 检查服务状态..."
+sleep 3
 
-# 显示安装信息
-show_info() {
-    SECRET=$(cat /etc/mtproxy/secret.txt)
-    IP=$(curl -s -4 ifconfig.co)
-    
-    if [[ -z "$IP" ]]; then
-        IP=$(hostname -I | awk '{print $1}')
-    fi
-    
-    echo ""
-    echo "========================================"
-    echo "   MTProxy 官方版安装完成"
-    echo "========================================"
-    echo "服务器IP: $IP"
-    echo "代理端口: $PROXY_PORT"
-    echo "管理端口: $MGMT_PORT"
-    echo "运行用户: $RUN_USER"
-    echo "Secret: $SECRET"
-    echo ""
-    echo "Telegram 代理链接:"
-    echo "tg://proxy?server=$IP&port=$PROXY_PORT&secret=$SECRET"
-    echo ""
-    echo "网页版链接:"
-    echo "https://t.me/proxy?server=$IP&port=$PROXY_PORT&secret=$SECRET"
-    echo ""
-    echo "管理命令:"
-    echo "启动: systemctl start mtproxy"
-    echo "停止: systemctl stop mtproxy"
-    echo "重启: systemctl restart mtproxy"
-    echo "状态: systemctl status mtproxy"
-    echo "日志: journalctl -u mtproxy -f"
-    echo ""
-    echo "配置文件位置: /etc/mtproxy/"
-    echo "========================================"
-}
+if systemctl is-active --quiet mtproxy; then
+    echo "✅ MTProxy 服务启动成功"
+else
+    echo "❌ MTProxy 服务启动失败"
+    echo "查看日志: journalctl -u mtproxy -n 20"
+    exit 1
+fi
 
-# 主安装函数
-main_install() {
-    log_info "开始安装 MTProxy 官方版..."
-    
-    check_root
-    detect_os
-    get_user_config
-    install_dependencies
-    compile_mtproxy
-    get_configs
-    setup_service
-    setup_firewall
-    
-    # 启动服务
-    log_info "启动 MTProxy 服务..."
-    systemctl start mtproxy
-    
-    # 检查服务状态
-    sleep 3
-    if systemctl is-active --quiet mtproxy; then
-        log_info "MTProxy 服务启动成功"
-        show_info
-    else
-        log_error "MTProxy 服务启动失败"
-        journalctl -u mtproxy --no-pager -l
-        exit 1
-    fi
-}
+# 获取服务器IP
+IP=$(curl -s -4 ifconfig.co || curl -s -6 ifconfig.co || hostname -I | awk '{print $1}')
 
-# 卸载函数
-uninstall() {
-    log_warn "开始卸载 MTProxy..."
-    
-    systemctl stop mtproxy 2>/dev/null || true
-    systemctl disable mtproxy 2>/dev/null || true
-    rm -f /etc/systemd/system/mtproxy.service
-    rm -f /usr/local/bin/mtproto-proxy
-    rm -rf /etc/mtproxy
-    systemctl daemon-reload
-    
-    log_info "MTProxy 已卸载"
-}
+# 生成代理链接
+TG_LINK="tg://proxy?server=$IP&port=$CLIENT_PORT&secret=$SECRET"
+TG_HTTP_LINK="https://t.me/proxy?server=$IP&port=$CLIENT_PORT&secret=$SECRET"
 
-# 显示使用说明
-usage() {
-    echo "使用方法: $0 [选项]"
-    echo "选项:"
-    echo "  install   安装 MTProxy"
-    echo "  uninstall 卸载 MTProxy"
-    echo "  help      显示此帮助信息"
-}
-
-# 主逻辑
-case "${1:-install}" in
-    install)
-        main_install
-        ;;
-    uninstall)
-        uninstall
-        ;;
-    help|--help|-h)
-        usage
-        ;;
-    *)
-        echo "未知选项: $1"
-        usage
-        exit 1
-        ;;
-esac
+echo ""
+echo "========================================"
+echo "    🎉 MTProxy 安装成功!"
+echo "========================================"
+echo "服务器配置:"
+echo "  📡 服务器IP: $IP"
+echo "  🔌 客户端端口: $CLIENT_PORT"
+echo "  🛠️  管理端口: $LOCAL_PORT"
+echo "  👤 运行用户: $RUN_USER"
+echo "  🔑 密钥: $SECRET"
+echo "  🚀 工作进程: $WORKERS"
+echo ""
+echo "Telegram 代理链接:"
+echo "  📱 $TG_LINK"
+echo ""
+echo "网页版链接:"
+echo "  💻 $TG_HTTP_LINK"
+echo ""
+echo "管理命令:"
+echo "  systemctl status mtproxy    # 查看状态"
+echo "  systemctl restart mtproxy   # 重启服务"
+echo "  journalctl -u mtproxy -f    # 查看日志"
+echo "  curl http://localhost:$LOCAL_PORT/stats  # 查看统计"
+echo ""
+echo "下一步:"
+echo "  1. 在Telegram中点击上面的链接配置代理"
+echo "  2. 可选: 通过 @MTProxybot 注册代理获取代理标签"
+echo "  3. 使用 -P <proxy_tag> 参数重新启动服务"
+echo ""
+echo "配置文件位置: /opt/mtproxy/"
+echo "密钥备份: /opt/mtproxy/secret.txt"
+echo "========================================"
