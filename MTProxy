@@ -1,7 +1,9 @@
 #!/bin/bash
-
-# MTProxy 一键安装脚本
+# ============================================================
+# MTProxy 一键安装脚本（含 PID 修复补丁）
 # 支持系统: CentOS 7+, Ubuntu 16.04+, Debian 9+
+# 作者: ChatGPT 修正版（解决 Assertion `!(p & 0xffff0000)' failed）
+# ============================================================
 
 set -e
 
@@ -13,38 +15,18 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # 日志函数
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_debug() {
-    echo -e "${BLUE}[DEBUG]${NC} $1"
-}
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_debug() { echo -e "${BLUE}[DEBUG]${NC} $1"; }
 
 # 检查端口是否被占用
 check_port() {
     if command -v netstat &> /dev/null; then
-        if netstat -tuln | grep ":$1 " > /dev/null; then
-            return 0  # 端口被占用
-        else
-            return 1  # 端口空闲
-        fi
+        netstat -tuln | grep -q ":$1 " && return 0 || return 1
     elif command -v ss &> /dev/null; then
-        if ss -tuln | grep ":$1 " > /dev/null; then
-            return 0  # 端口被占用
-        else
-            return 1  # 端口空闲
-        fi
+        ss -tuln | grep -q ":$1 " && return 0 || return 1
     else
-        # 如果两个命令都没有，假设端口可用
         return 1
     fi
 }
@@ -54,48 +36,39 @@ get_user_input() {
     echo "================================"
     echo "    MTProxy 安装配置"
     echo "================================"
-    
-    # 获取代理端口
+
     while true; do
         read -p "请输入MTProxy代理端口 [默认: 443]: " PROXY_PORT
         PROXY_PORT=${PROXY_PORT:-443}
-        
         if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
             log_error "端口号必须是1-65535之间的数字"
             continue
         fi
-        
         if check_port $PROXY_PORT; then
             log_warn "端口 $PROXY_PORT 已被占用，请选择其他端口"
             continue
         fi
-        
         break
     done
-    
-    # 获取管理端口
+
     while true; do
         read -p "请输入MTProxy管理端口 [默认: 8888]: " MGMT_PORT
         MGMT_PORT=${MGMT_PORT:-8888}
-        
         if ! [[ "$MGMT_PORT" =~ ^[0-9]+$ ]] || [ "$MGMT_PORT" -lt 1 ] || [ "$MGMT_PORT" -gt 65535 ]; then
             log_error "端口号必须是1-65535之间的数字"
             continue
         fi
-        
         if [ "$MGMT_PORT" = "$PROXY_PORT" ]; then
             log_error "管理端口不能与代理端口相同"
             continue
         fi
-        
         if check_port $MGMT_PORT; then
             log_warn "端口 $MGMT_PORT 已被占用，请选择其他端口"
             continue
         fi
-        
         break
     done
-    
+
     log_info "代理端口: $PROXY_PORT"
     log_info "管理端口: $MGMT_PORT"
 }
@@ -126,7 +99,6 @@ detect_os() {
 # 安装依赖
 install_dependencies() {
     log_info "安装依赖包..."
-    
     case $OS in
         centos)
             yum update -y
@@ -138,83 +110,70 @@ install_dependencies() {
             apt install -y git curl wget build-essential libssl-dev zlib1g-dev
             ;;
     esac
-    
     log_info "依赖包安装完成"
 }
 
-# 安装MTProxy
+# 安装MTProxy（带断言修复）
 install_mtproxy() {
     log_info "开始安装MTProxy..."
-    
-    # 创建工作目录
     mkdir -p /opt/mtproxy
     cd /opt/mtproxy
-    
-    # 清理旧安装
+
     if [[ -d "MTProxy" ]]; then
         log_warn "检测到旧版MTProxy，正在清理..."
         rm -rf MTProxy
     fi
-    
-    # 下载源码
+
     log_info "下载MTProxy源码..."
     git clone https://github.com/TelegramMessenger/MTProxy.git
-    
     cd MTProxy
-    
-    # 编译安装
+
+    # 修复 PID 断言错误
+    if grep -q "assert(!(p & 0xffff0000));" common/pid.c 2>/dev/null; then
+        log_warn "检测到 PID 断言限制，正在自动修复..."
+        sed -i 's/assert(!(p & 0xffff0000));/\/\/ assert removed for high PID compatibility;/' common/pid.c
+        log_info "PID 断言已修复"
+    fi
+
     log_info "编译MTProxy..."
     make
-    
-    # 复制二进制文件
+
     cp objs/bin/mtproto-proxy /usr/local/bin/
-    
     log_info "MTProxy编译安装完成"
 }
 
 # 生成配置
 generate_config() {
     log_info "生成配置文件..."
-    
     cd /opt/mtproxy
-    
-    # 获取Telegram代理secret
+
     log_info "从Telegram获取代理secret..."
     if ! curl -s https://core.telegram.org/getProxySecret -o /opt/mtproxy/proxy-secret; then
         log_warn "无法从Telegram获取代理secret，使用本地生成"
         openssl rand -hex 16 > /opt/mtproxy/proxy-secret
     fi
-    
-    # 获取Telegram代理配置
+
     log_info "从Telegram获取代理配置..."
     if ! curl -s https://core.telegram.org/getProxyConfig -o /opt/mtproxy/proxy-multi.conf; then
         log_error "无法获取代理配置，安装失败"
         exit 1
     fi
-    
-    # 生成自定义secret
+
     CUSTOM_SECRET=$(head -c 16 /dev/urandom | xxd -ps)
     echo "$CUSTOM_SECRET" > /opt/mtproxy/proxy-secret-custom
-    
     log_info "自定义secret: $CUSTOM_SECRET"
 }
 
 # 配置服务
 setup_service() {
     log_info "配置系统服务..."
-    
-    # 停止旧服务（如果存在）
     if systemctl is-active --quiet mtproxy; then
-        log_info "停止运行中的MTProxy服务..."
         systemctl stop mtproxy
     fi
-    
     if systemctl is-enabled --quiet mtproxy; then
-        log_info "禁用旧MTProxy服务..."
         systemctl disable mtproxy
     fi
-    
-    # 创建服务文件
+
     cat > /etc/systemd/system/mtproxy.service << EOF
 [Unit]
 Description=MTProxy Telegram Proxy
@@ -234,56 +193,45 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    # 重新加载systemd
     systemctl daemon-reload
     systemctl enable mtproxy
-    
     log_info "系统服务配置完成"
 }
 
-# 显示安装信息
+# 显示信息
 show_info() {
     echo ""
     echo "================================"
     echo "      MTProxy 安装完成"
     echo "================================"
-    log_info "代理地址: $(curl -s -4 ifconfig.co)"
-    log_info "代理端口: $PROXY_PORT"
-    log_info "Secret: $CUSTOM_SECRET"
-    log_info "管理端口: $MGMT_PORT"
+    IP=$(curl -s -4 ifconfig.co)
+    log_info "代理地址: ${IP}"
+    log_info "代理端口: ${PROXY_PORT}"
+    log_info "Secret: ${CUSTOM_SECRET}"
+    log_info "管理端口: ${MGMT_PORT}"
     echo "================================"
     echo "服务管理命令:"
-    echo "启动服务: systemctl start mtproxy"
-    echo "停止服务: systemctl stop mtproxy"
-    echo "重启服务: systemctl restart mtproxy"
-    echo "查看状态: systemctl status mtproxy"
-    echo "查看日志: journalctl -u mtproxy -f"
+    echo "systemctl start mtproxy"
+    echo "systemctl stop mtproxy"
+    echo "systemctl restart mtproxy"
+    echo "systemctl status mtproxy"
+    echo "journalctl -u mtproxy -f"
     echo "================================"
-    
-    # 显示TG代理链接
-    IP=$(curl -s -4 ifconfig.co)
-    echo "Telegram代理链接:"
+    echo "Telegram 代理链接:"
     echo "tg://proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
-    echo ""
-    echo "或使用以下格式:"
     echo "https://t.me/proxy?server=${IP}&port=${PROXY_PORT}&secret=${CUSTOM_SECRET}"
     echo "================================"
     log_info "安装完成！"
 }
 
-# 清理函数（用于异常退出）
 cleanup() {
     log_error "安装过程中出现错误，正在清理..."
     exit 1
 }
-
-# 设置异常处理
 trap cleanup ERR
 
-# 主函数
 main() {
     log_info "开始安装MTProxy..."
-    
     check_root
     detect_os
     get_user_input
@@ -291,44 +239,34 @@ main() {
     install_mtproxy
     generate_config
     setup_service
-    
-    # 启动服务
+
     log_info "启动MTProxy服务..."
     if systemctl start mtproxy; then
-        log_info "MTProxy服务启动成功"
+        sleep 2
+        if systemctl is-active --quiet mtproxy; then
+            show_info
+        else
+            log_error "MTProxy服务未正常运行"
+            journalctl -u mtproxy --no-pager -l
+            exit 1
+        fi
     else
         log_error "MTProxy服务启动失败"
         journalctl -u mtproxy --no-pager -l
         exit 1
     fi
-    
-    # 等待服务启动
-    sleep 2
-    
-    # 检查服务状态
-    if systemctl is-active --quiet mtproxy; then
-        show_info
-    else
-        log_error "MTProxy服务未正常运行"
-        journalctl -u mtproxy --no-pager -l
-        exit 1
-    fi
 }
 
-# 显示欢迎信息
 echo "================================"
-echo "    MTProxy 一键安装脚本"
+echo "    MTProxy 一键安装脚本（修复版）"
 echo "================================"
 echo "支持系统: CentOS 7+, Ubuntu 16.04+, Debian 9+"
-echo "作者: 基于用户需求定制"
 echo ""
 
-# 确认是否继续
 read -p "是否继续安装? (y/N): " confirm
 if [[ ! $confirm =~ ^[Yy]$ ]]; then
     echo "安装已取消"
     exit 0
 fi
 
-# 执行主函数
 main "$@"
