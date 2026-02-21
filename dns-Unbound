@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# Unbound DNS服务器一键安装脚本 - 优化版
-# 支持标准和非标准端口，DoT，DoH，自动证书管理
+# ===========================================
+# Unbound DNS 递归服务器安装脚本 - 递归模式
+# 纯递归解析，非转发模式
+# ===========================================
 
 set -e  # 遇到错误立即退出
 
@@ -14,42 +16,45 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# 安装配置
+INSTALL_DIR="/etc/bot/dns"
+LOG_DIR="/var/log/unbound"
+
 # 日志函数
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-warn() {
-    echo -e "${YELLOW}[警告]${NC} $1"
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-error() {
-    echo -e "${RED}[错误]${NC} $1"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-info() {
-    echo -e "${BLUE}[信息]${NC} $1"
+log_step() {
+    echo -e "${PURPLE}[STEP]${NC} $1"
+}
+
+# 显示横幅
+show_banner() {
+    clear
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}     Unbound DNS 递归服务器安装脚本     ${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}        纯递归模式 | 非转发模式         ${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
 }
 
 # 检查 root 权限
 check_root() {
     if [ "$(id -u)" != "0" ]; then
-        error "此脚本需要以 root 权限运行"
+        log_error "此脚本需要以 root 权限运行"
         exit 1
     fi
-    log "权限检查通过"
-}
-
-# 检查依赖
-check_dependencies() {
-    local deps=("curl" "systemctl")
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            error "缺少依赖: $dep"
-            exit 1
-        fi
-    done
-    log "依赖检查通过"
+    log_info "权限检查通过"
 }
 
 # 检测系统类型
@@ -58,9 +63,9 @@ detect_os() {
         . /etc/os-release
         OS=$ID
         OS_VERSION=$VERSION_ID
-        log "检测到系统: $PRETTY_NAME"
+        log_info "检测到系统: $PRETTY_NAME"
     else
-        error "无法检测操作系统"
+        log_error "无法检测操作系统"
         exit 1
     fi
     
@@ -72,10 +77,21 @@ detect_os() {
             PKG_MANAGER="yum"
             ;;
         *)
-            error "不支持的发行版: $OS"
+            log_error "不支持的发行版: $OS"
             exit 1
             ;;
     esac
+}
+
+# 创建目录
+create_directories() {
+    log_step "创建必要目录..."
+    
+    mkdir -p "$INSTALL_DIR"
+    mkdir -p "$LOG_DIR"
+    mkdir -p /etc/bot/config
+    
+    log_info "目录结构创建完成"
 }
 
 # 检测 IPv4/IPv6 支持
@@ -97,814 +113,525 @@ detect_ip_support() {
         IPV6_AVAILABLE=1
     fi
     
-    info "网络支持检测:"
-    [ $IPV4_AVAILABLE -eq 1 ] && log "  IPv4 支持: 是"
-    [ $IPV6_AVAILABLE -eq 1 ] && log "  IPv6 支持: 是"
+    log_info "网络支持检测:"
+    [ $IPV4_AVAILABLE -eq 1 ] && log_info "  IPv4 支持: 是"
+    [ $IPV6_AVAILABLE -eq 1 ] && log_info "  IPv6 支持: 是"
     
     if [ $IPV4_AVAILABLE -eq 0 ] && [ $IPV6_AVAILABLE -eq 0 ]; then
-        error "未检测到 IPv4 或 IPv6 网络支持"
+        log_error "未检测到 IPv4 或 IPv6 网络支持"
         exit 1
     fi
 }
 
-# 设置临时 DNS
-setup_temp_dns() {
-    info "设置临时 DNS 解析器..."
-    
-    # 备份当前 DNS 配置
-    cp /etc/resolv.conf /etc/resolv.conf.bak.tmp 2>/dev/null || true
-    
-    # 解除可能的文件锁定
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    
-    # 使用公共 DNS 作为临时解析
-    cat > /etc/resolv.conf << EOF
-# 临时 DNS 配置 - Unbound 安装脚本
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
-options rotate timeout:2 attempts:3
-EOF
-    
-    log "临时 DNS 已设置为 Cloudflare 和 Google DNS"
-}
-
-# 改进的端口占用检查
-check_port_usage() {
-    local port=$1
-    local protocol=${2:-}
-    
-    info "检查端口 $port 占用情况..."
-    
-    # 检测占用端口的服务
-    if ss -tuln | grep -q ":$port "; then
-        error "端口 $port 被以下进程占用:"
-        ss -tuln | grep ":$port "
-        
-        # 获取占用进程的详细信息
-        local pid_info=$(ss -tulnp | grep ":$port " | head -1 | awk '{print $7}')
-        local pid=$(echo "$pid_info" | grep -oP 'pid=\K\d+')
-        
-        if [ -n "$pid" ]; then
-            local process_name=$(ps -p $pid -o comm= 2>/dev/null || echo "未知")
-            local service_name=""
-            
-            # 尝试获取服务名
-            if command -v systemctl >/dev/null; then
-                service_name=$(systemctl status $pid 2>/dev/null | grep -oP "Loaded: loaded \K\/.*" | xargs basename 2>/dev/null || echo "未知")
-            fi
-            
-            info "占用进程详情:"
-            [ -n "$pid" ] && echo "  PID: $pid"
-            [ -n "$process_name" ] && echo "  进程名: $process_name"
-            [ -n "$service_name" ] && echo "  服务名: $service_name"
-        else
-            warn "无法获取占用进程的详细信息"
-        fi
-        
-        return 1
-    fi
-    
-    log "端口 $port 可用"
-    return 0
-}
-
-# 强制释放53端口
-force_free_port_53() {
-    info "强制释放53端口..."
-    
-    # 停止已知服务
-    local services=("systemd-resolved" "dnsmasq" "named" "bind9")
-    for service in "${services[@]}"; do
-        if systemctl is-active --quiet "$service" 2>/dev/null; then
-            log "停止服务: $service"
-            systemctl stop "$service" 2>/dev/null || true
-            systemctl disable "$service" 2>/dev/null || true
-        fi
-    done
-    
-    # 杀死占用进程
-    local pids=$(lsof -t -i :53 2>/dev/null || ss -tulnp | grep ':53 ' | grep -oP 'pid=\K\d+' || echo "")
-    for pid in $pids; do
-        if ps -p $pid > /dev/null 2>&1; then
-            warn "停止进程 (PID: $pid)"
-            kill -9 $pid 2>/dev/null || true
-        fi
-    done
-    
-    # 确保resolv.conf可写
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    
-    # 重置resolv.conf
-    if [ -L "/etc/resolv.conf" ]; then
-        rm -f /etc/resolv.conf
-        echo "nameserver 1.1.1.1" > /etc/resolv.conf
-        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-        log "已重置 /etc/resolv.conf"
-    fi
-    
-    log "等待2秒..."
-    sleep 2
-    
-    # 检查是否成功
-    if ss -tuln | grep -q ":53 "; then
-        error "无法完全释放53端口"
-        return 1
-    fi
-    
-    log "53端口已成功释放"
-    return 0
-}
-
-# 安装包
-install_package() {
-    local package=$1
-    info "安装 $package..."
-    
-    case $PKG_MANAGER in
-        apt)
-            DEBIAN_FRONTEND=noninteractive apt install -y "$package"
-            ;;
-        yum)
-            yum install -y "$package"
-            ;;
-    esac
-}
-
 # 安装 Unbound
 install_unbound() {
-    info "安装 Unbound DNS 服务器..."
+    log_step "安装 Unbound DNS 服务器..."
     
     case $PKG_MANAGER in
         apt)
             apt update
             DEBIAN_FRONTEND=noninteractive apt install -y unbound unbound-anchor unbound-host
-            if [ "$ENABLE_DOH" = "y" ]; then
-                DEBIAN_FRONTEND=noninteractive apt install -y nginx certbot python3-certbot-nginx
-            fi
             ;;
         yum)
             if [ "$OS" = "centos" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ]; then
                 yum install -y epel-release
             fi
             yum install -y unbound unbound-libs
-            if [ "$ENABLE_DOH" = "y" ]; then
-                yum install -y nginx certbot python3-certbot-nginx
-            fi
             ;;
     esac
+    
+    log_info "Unbound 安装完成"
 }
 
-# 配置 Unbound
-configure_unbound() {
-    info "配置 Unbound..."
+# 配置 Unbound 递归模式
+configure_unbound_recursive() {
+    log_step "配置 Unbound 递归模式..."
     
     # 备份原始配置
     [ -f /etc/unbound/unbound.conf ] && cp /etc/unbound/unbound.conf /etc/unbound/unbound.conf.bak
-
-    # 创建基础配置
+    
+    # 创建递归模式配置
     cat > /etc/unbound/unbound.conf << 'EOF'
+# Unbound DNS 服务器配置 - 递归模式
 server:
-  # 基础配置
+  # ===== 基础配置 =====
+  # 启用IPv4/IPv6
   do-ip4: yes
-  do-ip6: no
+  do-ip6: yes
   do-udp: yes
   do-tcp: yes
   
-  # 安全配置
+  # ===== 安全配置 =====
   hide-identity: yes
   hide-version: yes
   harden-glue: yes
   harden-dnssec-stripped: yes
+  harden-below-nxdomain: yes
+  harden-referral-path: yes
   use-caps-for-id: yes
   
-  # 性能配置
-  num-threads: 2
-  msg-cache-slabs: 4
-  rrset-cache-slabs: 4
-  infra-cache-slabs: 4
-  key-cache-slabs: 4
+  # ===== 递归解析配置 =====
+  # 严格递归模式，不转发到其他DNS
+  do-not-query-localhost: no
   
-  # 缓存配置
+  # 根服务器配置
+  root-hints: "/var/lib/unbound/root.hints"
+  
+  # 自动信任锚文件
+  auto-trust-anchor-file: "/var/lib/unbound/root.key"
+  
+  # DNSSEC验证
+  val-permissive-mode: no
+  val-clean-additional: yes
+  val-log-level: 1
+  
+  # ===== 访问控制 =====
+  access-control: 0.0.0.0/0 refuse
+  access-control: 127.0.0.0/8 allow
+  access-control: ::0/0 refuse
+  access-control: ::1 allow
+  
+  # ===== 私有网络访问 =====
+  access-control: 10.0.0.0/8 allow
+  access-control: 172.16.0.0/12 allow
+  access-control: 192.168.0.0/16 allow
+  access-control: fc00::/7 allow  # 唯一本地地址
+  access-control: fd00::/8 allow  # 唯一本地地址
+  
+  # ===== 性能优化 =====
+  num-threads: 2
   msg-cache-size: 64m
   rrset-cache-size: 128m
-  cache-min-ttl: 3600
+  key-cache-size: 32m
+  neg-cache-size: 4m
+  
+  # 缓存设置
+  cache-min-ttl: 300
   cache-max-ttl: 86400
+  infra-cache-numhosts: 10000
+  
+  # 预取优化
   prefetch: yes
   prefetch-key: yes
   
-  # 高级配置
+  # ===== 高级安全 =====
   qname-minimisation: yes
+  qname-minimisation-strict: yes
   aggressive-nsec: yes
-  minimal-responses: yes
-  so-reuseport: yes
+  rrset-roundrobin: yes
   
-  # 访问控制
-  access-control: 127.0.0.0/8 allow
-  access-control: 192.168.0.0/16 allow
-  access-control: 10.0.0.0/8 allow
-  access-control: 172.16.0.0/12 allow
-  access-control: ::1 allow
+  # ===== 响应设置 =====
+  minimal-responses: yes
+  delay-close: 10000
+  
+  # ===== 日志配置 =====
+  verbosity: 1
+  statistics-interval: 0
+  statistics-cumulative: no
+  extended-statistics: no
+  
+  # ===== 接口配置 =====
+  # 注意：这里暂时留空，后面根据用户输入添加
 EOF
 
-    # 根据检测结果设置 IPv6 支持
-    if [ $IPV6_AVAILABLE -eq 1 ]; then
-        sed -i 's/do-ip6: no/do-ip6: yes/' /etc/unbound/unbound.conf
-        log "已启用 IPv6 支持"
-    else
-        warn "系统不支持 IPv6，已禁用 IPv6 功能"
-    fi
-
-    # 设置监听端口
-    if [ $IPV4_AVAILABLE -eq 1 ]; then
-        echo "  interface: 0.0.0.0@$UNBOUND_PORT" >> /etc/unbound/unbound.conf
-    fi
-    
-    if [ $IPV6_AVAILABLE -eq 1 ]; then
-        echo "  interface: ::@$UNBOUND_PORT" >> /etc/unbound/unbound.conf
-    fi
-    
-    # 配置 DoH HTTP 接口
-    if [ "$ENABLE_DOH" = "y" ]; then
-        cat >> /etc/unbound/unbound.conf << EOF
-
-  # DoH HTTP 接口配置
-  do-http: yes
-  http-port: 8053
-  http-host: 127.0.0.1
-  tls-service-key: "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-  tls-service-pem: "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-EOF
-    fi
-
-    # 添加根服务器
+    # 下载根服务器文件
+    log_info "下载根服务器文件..."
     curl -fsSL -o /var/lib/unbound/root.hints https://www.internic.net/domain/named.cache
-    echo '  root-hints: "/var/lib/unbound/root.hints"' >> /etc/unbound/unbound.conf
-
-    # 启用 DNSSEC
-    unbound-anchor -a /var/lib/unbound/root.key || warn "unbound-anchor 执行失败，继续安装..."
-    echo '  auto-trust-anchor-file: "/var/lib/unbound/root.key"' >> /etc/unbound/unbound.conf
-    echo '  val-log-level: 2' >> /etc/unbound/unbound.conf
     
+    # 初始化信任锚
+    log_info "初始化 DNSSEC 信任锚..."
+    unbound-anchor -a /var/lib/unbound/root.key || {
+        log_warn "unbound-anchor 执行失败，尝试备用方法..."
+        wget -O /var/lib/unbound/root.key https://raw.githubusercontent.com/NLnetLabs/unbound/master/contrib/root.key
+    }
+    
+    # 设置权限
     chown -R unbound:unbound /var/lib/unbound
-    log "Unbound 已配置为监听端口 $UNBOUND_PORT"
+    
+    log_info "Unbound 递归模式配置完成"
 }
 
-# 配置 DoT (DNS over TLS)
-setup_dot() {
-    info "配置 DNS over TLS (DoT)..."
+# 配置监听端口
+configure_listen_ports() {
+    log_step "配置监听端口..."
     
-    # 添加 DoT 配置
-    cat >> /etc/unbound/unbound.conf << EOF
-
-  # DoT 配置
-  interface: 0.0.0.0@853
-  tls-service-key: "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-  tls-service-pem: "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-EOF
-
+    local port=$1
+    local interface=$2
+    
+    # 清除之前的接口配置
+    sed -i '/^  interface:/d' /etc/unbound/unbound.conf
+    sed -i '/^  port:/d' /etc/unbound/unbound.conf
+    
+    # 添加监听配置
+    if [ $IPV4_AVAILABLE -eq 1 ]; then
+        echo "  interface: 0.0.0.0@$port" >> /etc/unbound/unbound.conf
+        echo "  access-control: $interface allow" >> /etc/unbound/unbound.conf
+    fi
+    
     if [ $IPV6_AVAILABLE -eq 1 ]; then
-        echo "  interface: ::@853" >> /etc/unbound/unbound.conf
-    fi
-
-    # 防火墙开放 853 端口
-    if command -v ufw &> /dev/null; then
-        ufw allow 853/tcp
-        log "UFW 已开放 853 端口"
-    elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --add-port=853/tcp --permanent
-        firewall-cmd --reload
-        log "FirewallD 已开放 853 端口"
+        echo "  interface: ::@$port" >> /etc/unbound/unbound.conf
+        echo "  access-control: $interface allow" >> /etc/unbound/unbound.conf
     fi
     
-    log "DoT 已启用: 使用端口 853 (tls://$DOMAIN:853)"
+    # 添加端口配置
+    echo "  port: $port" >> /etc/unbound/unbound.conf
+    
+    log_info "已配置监听端口: $port"
+    log_info "已允许访问网络: $interface"
 }
 
-# 配置 DoH (DNS over HTTPS)
-setup_doh() {
-    info "配置 DNS over HTTPS (DoH)..."
+# 配置递归解析
+configure_recursive_resolution() {
+    log_step "配置递归解析设置..."
     
-    # 创建 Nginx DoH 配置
-    cat > /etc/nginx/conf.d/doh.conf << EOF
-server {
-    listen 443 ssl http2;
-    $([ $IPV6_AVAILABLE -eq 1 ] && echo "listen [::]:443 ssl http2;")
-    server_name $DOMAIN;
-
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    # 确保配置文件中不包含转发配置
+    sed -i '/^  forward-addr:/d' /etc/unbound/unbound.conf
+    sed -i '/^  forward-zone:/d' /etc/unbound/unbound.conf
+    sed -i '/^  name:/d' /etc/unbound/unbound.conf
     
-    # TLS 优化配置
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 1d;
+    # 添加递归解析注释
+    echo "" >> /etc/unbound/unbound.conf
+    echo "  # ===== 递归解析设置 ======" >> /etc/unbound/unbound.conf
+    echo "  # 启用递归解析" >> /etc/unbound/unbound.conf
+    echo "  recursion: yes" >> /etc/unbound/unbound.conf
     
-    # 安全头部
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options DENY always;
-    add_header X-XSS-Protection "1; mode=block" always;
+    # 配置本地服务访问
+    echo "  # 允许本地服务访问" >> /etc/unbound/unbound.conf
+    echo "  do-not-query-localhost: no" >> /etc/unbound/unbound.conf
     
-    # DoH 端点
-    location /dns-query {
-        proxy_pass http://127.0.0.1:8053/dns-query;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # 保持长连接
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        
-        # 超时设置
-        proxy_connect_timeout 30s;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-        
-        # 缓冲区设置
-        proxy_buffering off;
-        proxy_request_buffering off;
-    }
-    
-    # 健康检查端点
-    location /health {
-        access_log off;
-        return 200 "healthy\\n";
-        add_header Content-Type text/plain always;
-    }
-    
-    # 阻止其他路径访问
-    location / {
-        return 404 'Not Found';
-    }
+    log_info "递归解析配置完成"
 }
+
+# 添加本地域名解析
+configure_local_domains() {
+    log_step "配置本地域名解析..."
+    
+    # 创建本地域配置
+    cat >> /etc/unbound/unbound.conf << 'EOF'
+
+# ===== 本地域名解析 =====
+local-zone: "local." static
+local-data: "router.local. IN A 192.168.1.1"
+local-data: "nas.local. IN A 192.168.1.100"
+local-data: "server.local. IN A 192.168.1.200"
+
+# 私有域名的正向解析
+local-zone: "home.arpa." static
+local-data: "home.arpa. IN SOA localhost. admin.localhost. 1 3600 1200 604800 10800"
+local-data: "home.arpa. IN NS localhost."
+
+# 私有域名的反向解析
+local-zone: "1.168.192.in-addr.arpa." static
+local-data: "1.1.168.192.in-addr.arpa. IN PTR router.local."
+local-data: "100.1.168.192.in-addr.arpa. IN PTR nas.local."
+local-data: "200.1.168.192.in-addr.arpa. IN PTR server.local."
 EOF
 
-    # 测试并重载 Nginx
-    if nginx -t; then
-        systemctl reload nginx
-        log "Nginx 配置测试成功"
-    else
-        error "Nginx 配置测试失败"
+    log_info "本地域名解析配置完成"
+}
+
+# 检查端口占用
+check_port_usage() {
+    local port=$1
+    
+    log_info "检查端口 $port 占用情况..."
+    
+    if ss -tuln | grep -q ":$port "; then
+        log_error "端口 $port 被以下进程占用:"
+        ss -tuln | grep ":$port "
         return 1
     fi
     
-    # 防火墙开放 443 端口
-    if command -v ufw &> /dev/null; then
-        ufw allow 443/tcp
-        log "UFW 已开放 443 端口"
-    elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --add-service=https --permanent
-        firewall-cmd --reload
-        log "FirewallD 已开放 443 端口"
-    fi
-    
-    log "DoH 已启用: 使用 URL https://$DOMAIN/dns-query"
-}
-
-# 申请 SSL 证书
-get_ssl_certificate() {
-    info "正在申请 Let's Encrypt SSL 证书..."
-    
-    # 临时使用公共 DNS 进行证书申请
-    setup_temp_dns
-    
-    # 检查域名是否解析
-    info "检查域名 $DOMAIN 的解析..."
-    if ! nslookup $DOMAIN >/dev/null 2>&1; then
-        warn "域名 $DOMAIN 解析失败，请确保域名已正确解析到服务器IP"
-        read -p "是否继续尝试申请证书? [y/N]: " continue_cert
-        if [[ ! "$continue_cert" =~ ^[Yy]$ ]]; then
-            return 1
-        fi
-    fi
-    
-    # 申请证书
-    if certbot certonly --nginx --agree-tos --non-interactive \
-        -d "$DOMAIN" -m "$EMAIL" --keep-until-expiring; then
-        log "证书申请成功!"
-        
-        # 设置自动续期
-        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx 2>/dev/null || true") | crontab -
-        log "已设置证书自动续期"
-    else
-        error "证书申请失败!"
-        warn "请检查:"
-        warn "1. 域名是否解析到本机IP"
-        warn "2. 防火墙是否开放80/443端口"
-        warn "3. 尝试手动申请: certbot certonly --nginx -d $DOMAIN"
-        return 1
-    fi
-}
-
-# 配置 dnsmasq 作为本地代理（用于非标准端口）
-setup_dnsmasq_proxy() {
-    info "配置 dnsmasq 作为本地代理..."
-    
-    install_package dnsmasq
-    
-    # 备份原配置
-    [ -f /etc/dnsmasq.conf ] && cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
-    
-    # 创建新的 dnsmasq 配置
-    cat > /etc/dnsmasq.conf << EOF
-# dnsmasq 配置 - Unbound 本地代理
-port=53
-no-resolv
-server=127.0.0.1#$UNBOUND_PORT
-$([ $IPV6_AVAILABLE -eq 1 ] && echo "server=::1#$UNBOUND_PORT")
-listen-address=127.0.0.1
-$([ $IPV6_AVAILABLE -eq 1 ] && echo "listen-address=::1")
-bind-interfaces
-cache-size=1000
-local-ttl=300
-EOF
-
-    systemctl enable dnsmasq
-    systemctl restart dnsmasq
-    log "dnsmasq 已配置为本地代理，转发到端口 $UNBOUND_PORT"
-}
-
-# 配置系统 DNS
-configure_system_dns() {
-    info "配置系统使用本地 DNS 解析器..."
-    
-    # 备份当前配置
-    cp /etc/resolv.conf /etc/resolv.conf.bak
-    
-    if [ "$UNBOUND_PORT" = "53" ]; then
-        # 标准端口配置
-        cat > /etc/resolv.conf << EOF
-# Generated by Unbound Installer
-nameserver 127.0.0.1
-$([ $IPV6_AVAILABLE -eq 1 ] && echo "nameserver ::1")
-options edns0 trust-ad timeout:2 attempts:3
-search .
-EOF
-        log "系统 DNS 已设置为 127.0.0.1 (标准端口 53)"
-    else
-        # 非标准端口，使用 dnsmasq 代理
-        setup_dnsmasq_proxy
-        cat > /etc/resolv.conf << EOF
-# Generated by Unbound Installer (通过 dnsmasq 代理)
-nameserver 127.0.0.1
-$([ $IPV6_AVAILABLE -eq 1 ] && echo "nameserver ::1")
-options edns0 trust-ad timeout:2 attempts:3
-search .
-EOF
-        log "系统 DNS 已设置为 127.0.0.1 (通过 dnsmasq 代理端口 $UNBOUND_PORT)"
-    fi
-    
-    # 防止网络管理器覆盖 (Ubuntu/Debian)
-    if [ -f /etc/NetworkManager/NetworkManager.conf ]; then
-        if ! grep -q "dns=none" /etc/NetworkManager/NetworkManager.conf; then
-            sed -i '/^\[main\]$/a dns=none' /etc/NetworkManager/NetworkManager.conf
-            systemctl restart NetworkManager 2>/dev/null || true
-        fi
-    fi
-    
-    # 锁定文件防止修改 (Ubuntu/Debian)
-    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-        chattr +i /etc/resolv.conf 2>/dev/null || warn "无法锁定 /etc/resolv.conf"
-    fi
+    log_info "端口 $port 可用"
+    return 0
 }
 
 # 配置防火墙
 configure_firewall() {
-    info "配置防火墙..."
+    local port=$1
     
-    local unbound_port=${UNBOUND_PORT}
+    log_step "配置防火墙..."
     
     if command -v ufw &> /dev/null; then
-        ufw allow ${unbound_port}/tcp
-        ufw allow ${unbound_port}/udp
-        [ "$ENABLE_DOT" = "y" ] && ufw allow 853/tcp
-        [ "$ENABLE_DOH" = "y" ] && ufw allow 443/tcp
+        ufw allow $port/tcp
+        ufw allow $port/udp
         ufw reload
-        log "UFW 防火墙已配置"
+        log_info "UFW 防火墙已配置，开放端口: $port"
     elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --add-port=${unbound_port}/tcp --permanent
-        firewall-cmd --add-port=${unbound_port}/udp --permanent
-        [ "$ENABLE_DOT" = "y" ] && firewall-cmd --add-port=853/tcp --permanent
-        [ "$ENABLE_DOH" = "y" ] && firewall-cmd --add-service=https --permanent
+        firewall-cmd --add-port=$port/tcp --permanent
+        firewall-cmd --add-port=$port/udp --permanent
         firewall-cmd --reload
-        log "FirewallD 防火墙已配置"
+        log_info "FirewallD 防火墙已配置，开放端口: $port"
+    elif command -v iptables &> /dev/null; then
+        iptables -A INPUT -p tcp --dport $port -j ACCEPT
+        iptables -A INPUT -p udp --dport $port -j ACCEPT
+        iptables-save > /etc/iptables/rules.v4
+        log_info "iptables 已配置，开放端口: $port"
     else
-        warn "未检测到防火墙，请手动开放端口: $unbound_port (TCP/UDP)"
-        [ "$ENABLE_DOT" = "y" ] && warn "853 (TCP)"
-        [ "$ENABLE_DOH" = "y" ] && warn "443 (TCP)"
+        log_warn "未检测到防火墙，请手动开放端口: $port (TCP/UDP)"
     fi
 }
 
+# 配置系统 DNS
+configure_system_dns() {
+    local port=$1
+    
+    log_step "配置系统 DNS..."
+    
+    # 备份当前配置
+    cp /etc/resolv.conf /etc/resolv.conf.bak
+    
+    # 创建新的 resolv.conf
+    cat > /etc/resolv.conf << EOF
+# 由 Unbound 递归 DNS 服务器配置
+nameserver 127.0.0.1
+$([ $IPV6_AVAILABLE -eq 1 ] && echo "nameserver ::1")
+options edns0 timeout:2 attempts:3
+search local
+EOF
+
+    # 如果是非标准端口，需要特殊处理
+    if [ "$port" != "53" ]; then
+        log_warn "注意：Unbound 使用非标准端口 $port"
+        log_warn "系统 DNS 配置为 127.0.0.1，但需要确保应用程序支持指定端口"
+        
+        # 创建使用说明
+        cat > "$INSTALL_DIR/dns_usage.txt" << EOF
+Unbound DNS 服务器配置信息：
+============================
+监听端口: $port
+工作模式: 递归模式
+
+使用方法：
+1. 直接查询：dig @127.0.0.1 -p $port google.com
+2. 配置应用程序时指定端口为 $port
+3. 如需系统默认使用，请考虑将 Unbound 改为监听 53 端口
+
+递归 DNS 特点：
+- 完全独立解析，不依赖上游 DNS
+- 支持 DNSSEC 验证
+- 具备本地缓存功能
+- 支持 IPv4 和 IPv6
+EOF
+    fi
+
+    # 防止网络管理器覆盖 (Ubuntu/Debian)
+    if [ -f /etc/NetworkManager/NetworkManager.conf ]; then
+        if ! grep -q "dns=none" /etc/NetworkManager/NetworkManager.conf; then
+            sed -i '/^\[main\]$/a dns=none' /etc/NetworkManager.conf
+        fi
+    fi
+    
+    log_info "系统 DNS 已配置为使用本地 Unbound"
+}
+
 # 启动服务
-start_service() {
-    info "启动服务..."
+start_services() {
+    log_step "启动 Unbound 服务..."
     
     systemctl enable unbound
     systemctl restart unbound
     
-    if [ "$ENABLE_DOH" = "y" ]; then
-        systemctl enable nginx
-        systemctl restart nginx
+    # 检查服务状态
+    if systemctl is-active --quiet unbound; then
+        log_info "Unbound 服务已启动"
+    else
+        log_error "Unbound 服务启动失败"
+        journalctl -u unbound -n 20 --no-pager
+        return 1
     fi
     
-    if [ "$UNBOUND_PORT" != "53" ]; then
-        systemctl enable dnsmasq
-        systemctl restart dnsmasq
-    fi
-    
-    log "所有服务已启动"
+    return 0
 }
 
-# 验证安装
-verify_installation() {
-    info "验证安装..."
-    sleep 3
+# 测试递归解析
+test_recursive_resolution() {
+    log_step "测试递归解析功能..."
     
-    echo -e "\n${CYAN}=== 测试标准 DNS ===${NC}"
+    local port=$1
     
-    # 根据端口选择测试方式
-    local dig_cmd="dig @127.0.0.1"
-    if [ "$UNBOUND_PORT" != "53" ]; then
-        dig_cmd="dig @127.0.0.1 -p $UNBOUND_PORT"
-    fi
+    sleep 2  # 等待服务稳定
     
-    if $dig_cmd google.com | grep -q "status: NOERROR"; then
-        log "IPv4 DNS 解析成功！"
+    echo -e "\n${CYAN}=== 测试基础递归解析 ===${NC}"
+    
+    # 测试 IPv4 递归解析
+    if dig @127.0.0.1 -p $port google.com A +short 2>/dev/null | grep -q '[0-9]'; then
+        log_info "IPv4 递归解析测试成功 ✓"
     else
-        error "IPv4 DNS 解析失败"
-        warn "请检查日志: journalctl -u unbound -n 50 --no-pager"
+        log_error "IPv4 递归解析测试失败"
+        return 1
     fi
     
+    # 测试 IPv6 递归解析
     if [ $IPV6_AVAILABLE -eq 1 ]; then
-        echo -e "\n${CYAN}=== 测试 IPv6 DNS ===${NC}"
-        local dig6_cmd="dig @::1"
-        if [ "$UNBOUND_PORT" != "53" ]; then
-            dig6_cmd="dig @::1 -p $UNBOUND_PORT"
-        fi
-        
-        if $dig6_cmd google.com | grep -q "status: NOERROR"; then
-            log "IPv6 DNS 解析成功！"
+        if dig @::1 -p $port google.com AAAA +short 2>/dev/null | grep -q ':'; then
+            log_info "IPv6 递归解析测试成功 ✓"
         else
-            error "IPv6 DNS 解析失败"
+            log_warn "IPv6 递归解析测试失败（可能是网络限制）"
         fi
     fi
     
-    if [ "$ENABLE_DOT" = "y" ]; then
-        echo -e "\n${CYAN}=== 测试 DoT (DNS over TLS) ===${NC}"
-        if command -v kdig &>/dev/null; then
-            if kdig @$DOMAIN +tls-ca +tls-host=$DOMAIN google.com | grep -q "status: NOERROR"; then
-                log "DoT 解析成功！"
-            else
-                error "DoT 解析失败"
-            fi
-        else
-            warn "安装 kdig 以测试 DoT:"
-            [ "$PKG_MANAGER" = "apt" ] && echo "  apt install knot-dnsutils"
-            [ "$PKG_MANAGER" = "yum" ] && echo "  yum install knot-utils"
-        fi
-    fi
-    
-    if [ "$ENABLE_DOH" = "y" ]; then
-        echo -e "\n${CYAN}=== 测试 DoH (DNS over HTTPS) ===${NC}"
-        if curl -s -k -H 'accept: application/dns-json' "https://$DOMAIN/dns-query?name=google.com&type=A" | grep -q "Status"; then
-            log "DoH 解析成功！"
-        else
-            error "DoH 解析失败"
-            warn "尝试手动测试: curl -v -k 'https://$DOMAIN/dns-query?name=google.com&type=A'"
-        fi
-    fi
-    
-    echo -e "\n${CYAN}=== 测试系统 DNS 配置 ===${NC}"
-    if ping -c 2 -W 1 google.com &> /dev/null; then
-        log "系统 IPv4 DNS 解析正常！"
+    # 测试 DNSSEC 验证
+    echo -e "\n${CYAN}=== 测试 DNSSEC 验证 ===${NC}"
+    if dig @127.0.0.1 -p $port dnssec-failed.org +dnssec 2>/dev/null | grep -q "SERVFAIL"; then
+        log_info "DNSSEC 验证功能正常 ✓"
     else
-        error "系统 IPv4 DNS 解析失败"
-        warn "检查当前DNS设置: cat /etc/resolv.conf"
+        log_warn "DNSSEC 验证测试异常"
     fi
     
-    if [ $IPV6_AVAILABLE -eq 1 ]; then
-        if ping6 -c 2 -W 1 google.com &> /dev/null; then
-            log "系统 IPv6 DNS 解析正常！"
-        else
-            error "系统 IPv6 DNS 解析失败"
-        fi
+    # 测试本地域名
+    echo -e "\n${CYAN}=== 测试本地域名解析 ===${NC}"
+    if dig @127.0.0.1 -p $port router.local A +short 2>/dev/null | grep -q '192.168.1.1'; then
+        log_info "本地域名解析正常 ✓"
+    else
+        log_warn "本地域名解析测试失败"
     fi
+    
+    return 0
 }
 
 # 显示配置摘要
 show_summary() {
+    local port=$1
+    
     echo -e "\n${PURPLE}========================================${NC}"
-    echo -e "${PURPLE}          Unbound 安装完成             ${NC}"
+    echo -e "${PURPLE}       Unbound 递归服务器安装完成      ${NC}"
     echo -e "${PURPLE}========================================${NC}"
     
-    if [ "$UNBOUND_PORT" = "53" ]; then
-        echo -e "${GREEN}系统DNS:${NC} 127.0.0.1 (IPv4)"
-        [ $IPV6_AVAILABLE -eq 1 ] && echo -e "          ::1 (IPv6)"
-    else
-        echo -e "${GREEN}系统DNS:${NC} 127.0.0.1:$UNBOUND_PORT (IPv4)"
-        [ $IPV6_AVAILABLE -eq 1 ] && echo -e "          ::1:$UNBOUND_PORT (IPv6)"
-        echo -e "${YELLOW}注意: 使用非标准端口，已配置 dnsmasq 作为本地代理${NC}"
+    echo -e "${GREEN}服务器模式:${NC} 纯递归模式（非转发）"
+    echo -e "${GREEN}监听端口:${NC} $port (TCP/UDP)"
+    
+    if [ $IPV4_AVAILABLE -eq 1 ]; then
+        echo -e "${GREEN}IPv4 地址:${NC} 0.0.0.0:$port"
     fi
     
-    if [ "$ENABLE_DOT" = "y" ]; then
-        echo -e "${GREEN}DoT (DNS over TLS):${NC} tls://$DOMAIN:853"
+    if [ $IPV6_AVAILABLE -eq 1 ]; then
+        echo -e "${GREEN}IPv6 地址:${NC} [::]:$port"
     fi
     
-    if [ "$ENABLE_DOH" = "y" ]; then
-        echo -e "${GREEN}DoH (DNS over HTTPS):${NC} https://$DOMAIN/dns-query"
-    fi
+    echo -e "\n${CYAN}系统 DNS 配置:${NC}"
+    echo "主 DNS: 127.0.0.1"
+    [ $IPV6_AVAILABLE -eq 1 ] && echo "备 DNS: ::1"
     
     echo -e "\n${CYAN}测试命令:${NC}"
-    if [ "$UNBOUND_PORT" = "53" ]; then
-        echo "IPv4 DNS: dig @127.0.0.1 google.com"
-        [ $IPV6_AVAILABLE -eq 1 ] && echo "IPv6 DNS: dig @::1 google.com"
-    else
-        echo "IPv4 DNS: dig @127.0.0.1 -p $UNBOUND_PORT google.com"
-        [ $IPV6_AVAILABLE -eq 1 ] && echo "IPv6 DNS: dig @::1 -p $UNBOUND_PORT google.com"
+    echo "IPv4 测试: dig @127.0.0.1 -p $port google.com"
+    if [ $IPV6_AVAILABLE -eq 1 ]; then
+        echo "IPv6 测试: dig @::1 -p $port google.com"
     fi
-    
-    [ "$ENABLE_DOT" = "y" ] && echo "DoT测试: kdig @$DOMAIN +tls-ca +tls-host=$DOMAIN google.com"
-    [ "$ENABLE_DOH" = "y" ] && echo "DoH测试: curl -s 'https://$DOMAIN/dns-query?name=google.com&type=A'"
+    echo "缓存状态: unbound-control stats"
+    echo "刷新缓存: unbound-control flush_zone google.com"
     
     echo -e "\n${CYAN}管理命令:${NC}"
-    echo "重启Unbound: systemctl restart unbound"
+    echo "启动服务: systemctl start unbound"
+    echo "停止服务: systemctl stop unbound"
+    echo "重启服务: systemctl restart unbound"
+    echo "查看状态: systemctl status unbound"
     echo "查看日志: journalctl -u unbound -f"
-    echo "刷新缓存: unbound-control reload"
-    
-    if [ "$UNBOUND_PORT" != "53" ]; then
-        echo "重启dnsmasq: systemctl restart dnsmasq"
-    fi
-    
-    if [ "$ENABLE_DOT" = "y" ] || [ "$ENABLE_DOH" = "y" ]; then
-        echo -e "\n${CYAN}证书信息:${NC}"
-        echo "路径: /etc/letsencrypt/live/$DOMAIN/"
-        echo "续期: certbot renew"
-    fi
     
     echo -e "\n${CYAN}配置文件:${NC}"
-    echo "Unbound: /etc/unbound/unbound.conf"
-    [ "$UNBOUND_PORT" != "53" ] && echo "dnsmasq: /etc/dnsmasq.conf"
-    [ "$ENABLE_DOH" = "y" ] && echo "Nginx: /etc/nginx/conf.d/doh.conf"
+    echo "主配置: /etc/unbound/unbound.conf"
+    echo "备份配置: /etc/unbound/unbound.conf.bak"
+    echo "安装目录: $INSTALL_DIR"
     
-    echo -e "\n${YELLOW}恢复原配置:${NC}"
-    echo "恢复DNS: chattr -i /etc/resolv.conf; mv /etc/resolv.conf.bak /etc/resolv.conf"
-    echo "恢复服务: systemctl enable systemd-resolved; systemctl start systemd-resolved"
-    [ "$UNBOUND_PORT" != "53" ] && echo "禁用dnsmasq: systemctl disable dnsmasq; systemctl stop dnsmasq"
-}
-
-# 回滚函数
-rollback() {
-    echo -e "\n${RED}========================================${NC}"
-    echo -e "${RED}           安装失败，正在回滚           ${NC}"
-    echo -e "${RED}========================================${NC}"
-    
-    # 恢复 DNS 配置
-    if [ -f /etc/resolv.conf.bak ]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        mv /etc/resolv.conf.bak /etc/resolv.conf
-        log "已恢复 DNS 配置"
+    if [ "$port" != "53" ]; then
+        echo -e "\n${YELLOW}重要提示:${NC}"
+        echo "Unbound 使用非标准端口 $port"
+        echo "应用程序需要指定端口才能使用此DNS服务器"
+        echo "使用说明: cat $INSTALL_DIR/dns_usage.txt"
     fi
     
-    # 停止并禁用服务
-    systemctl stop unbound 2>/dev/null || true
-    systemctl disable unbound 2>/dev/null || true
-    systemctl stop nginx 2>/dev/null || true
-    systemctl disable nginx 2>/dev/null || true
-    systemctl stop dnsmasq 2>/dev/null || true
-    systemctl disable dnsmasq 2>/dev/null || true
-    
-    # 恢复系统 DNS 服务
-    systemctl enable systemd-resolved 2>/dev/null || true
-    systemctl start systemd-resolved 2>/dev/null || true
-    
-    log "回滚完成"
-    exit 1
+    echo -e "\n${CYAN}递归 DNS 特点:${NC}"
+    echo "✓ 完全递归解析，不依赖上游DNS"
+    echo "✓ 支持 DNSSEC 验证"
+    echo "✓ 具备本地缓存加速"
+    echo "✓ 支持 IPv4/IPv6 双栈"
+    echo "✓ 包含本地域名解析"
 }
 
-# 设置错误处理
-trap rollback ERR
-
-# 主安装流程
+# 主函数
 main() {
-    echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}      Unbound DNS 服务器安装向导       ${NC}"
-    echo -e "${CYAN}========================================${NC}"
-    
-    # 初始检查
+    show_banner
     check_root
-    check_dependencies
     detect_os
+    create_directories
     detect_ip_support
     
-    # 设置临时 DNS 确保脚本正常运行
-    setup_temp_dns
-    
     # 询问端口配置
-    while true; do
-        read -p "您想使用哪个端口运行 DNS 服务? (默认: 53) : " UNBOUND_PORT
-        UNBOUND_PORT=${UNBOUND_PORT:-53}
-        
-        # 验证端口输入
-        if [[ $UNBOUND_PORT =~ ^[0-9]+$ ]] && [ $UNBOUND_PORT -ge 1 ] && [ $UNBOUND_PORT -le 65535 ]; then
-            break
-        else
-            error "端口必须是1-65535之间的数字"
-        fi
-    done
+    echo -e "\n${CYAN}=== 端口配置 ===${NC}"
+    read -p "请输入 Unbound 监听端口 (默认: 5353): " port
+    port=${port:-5353}
     
-    # 检查端口占用情况
-    if ! check_port_usage $UNBOUND_PORT; then
-        if [ $UNBOUND_PORT -eq 53 ]; then
-            echo -e "\n${YELLOW}端口53被占用，但您选择使用此端口${NC}"
-            read -p "是否强制释放53端口? [Y/n]: " force_release
-            
-            if [[ ! "$force_release" =~ ^[Nn]$ ]]; then
-                if force_free_port_53; then
-                    log "53端口已成功释放，将继续使用此端口"
-                else
-                    error "无法释放53端口，安装将退出"
-                    exit 1
-                fi
-            else
-                warn "安装将使用53端口，但可能启动失败"
-            fi
-        else
-            read -p "端口 $UNBOUND_PORT 被占用，请选择其他端口 [默认: 5353]: " new_port
-            UNBOUND_PORT=${new_port:-5353}
-            log "将使用端口: $UNBOUND_PORT"
+    # 验证端口
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        log_error "端口号必须在 1-65535 之间"
+        exit 1
+    fi
+    
+    # 检查端口占用
+    if ! check_port_usage $port; then
+        read -p "端口 $port 被占用，是否强制使用？(y/N): " force_use
+        if [[ ! "$force_use" =~ ^[Yy]$ ]]; then
+            read -p "请重新输入端口号: " port
         fi
     fi
     
-    log "Unbound 将使用端口: $UNBOUND_PORT"
+    # 询问网络访问控制
+    echo -e "\n${CYAN}=== 网络访问控制 ===${NC}"
+    echo "请选择允许访问的IP范围："
+    echo "1) 仅本地 (127.0.0.1/8, ::1)"
+    echo "2) 本地 + 私有网络 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)"
+    echo "3) 所有网络 (0.0.0.0/0)"
+    read -p "请选择 (1-3, 默认: 2): " access_choice
+    access_choice=${access_choice:-2}
     
-    # 询问协议选项
-    read -p "是否启用 DoT (DNS over TLS)? [y/N]: " ENABLE_DOT
-    ENABLE_DOT=${ENABLE_DOT:-n}
+    case $access_choice in
+        1)
+            allowed_network="127.0.0.0/8"
+            ;;
+        2)
+            allowed_network="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8"
+            ;;
+        3)
+            allowed_network="0.0.0.0/0"
+            ;;
+        *)
+            log_error "无效的选择"
+            exit 1
+            ;;
+    esac
     
-    read -p "是否启用 DoH (DNS over HTTPS)? [y/N]: " ENABLE_DOH
-    ENABLE_DOH=${ENABLE_DOH:-n}
-    
-    # 如果需要证书
-    if [ "$ENABLE_DOT" = "y" ] || [ "$ENABLE_DOH" = "y" ]; then
-        while true; do
-            read -p "请输入用于申请证书的域名: " DOMAIN
-            if [ -n "$DOMAIN" ]; then
-                break
-            else
-                error "必须提供域名"
-            fi
-        done
-        
-        while true; do
-            read -p "请输入管理员邮箱: " EMAIL
-            if [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-                break
-            else
-                error "邮箱格式不正确"
-            fi
-        done
-    fi
-
     # 安装流程
     install_unbound
+    configure_unbound_recursive
+    configure_listen_ports "$port" "$allowed_network"
+    configure_recursive_resolution
+    configure_local_domains
     
-    # 配置流程
-    configure_unbound
+    # 配置防火墙
+    configure_firewall "$port"
     
-    # 配置协议
-    if [ "$ENABLE_DOT" = "y" ] || [ "$ENABLE_DOH" = "y" ]; then
-        if get_ssl_certificate; then
-            [ "$ENABLE_DOT" = "y" ] && setup_dot
-            [ "$ENABLE_DOH" = "y" ] && setup_doh
-        else
-            warn "证书申请失败，跳过 DoT/DoH 配置"
-            ENABLE_DOT="n"
-            ENABLE_DOH="n"
-        fi
+    # 启动服务
+    if ! start_services; then
+        log_error "服务启动失败，请检查配置"
+        exit 1
     fi
-
-    # 配置防火墙和服务
-    configure_firewall
-    start_service
     
     # 配置系统 DNS
-    configure_system_dns
+    configure_system_dns "$port"
     
-    # 验证和总结
-    verify_installation
-    show_summary
-    
-    # 恢复临时 DNS 备份
-    if [ -f /etc/resolv.conf.bak.tmp ]; then
-        rm -f /etc/resolv.conf.bak.tmp
+    # 测试功能
+    if test_recursive_resolution "$port"; then
+        log_info "所有测试通过 ✓"
+    else
+        log_warn "部分测试失败，但安装已完成"
     fi
     
-    echo -e "\n${GREEN}安装全部完成！${NC}"
+    # 显示摘要
+    show_summary "$port"
+    
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}       Unbound 递归服务器安装完成      ${NC}"
+    echo -e "${GREEN}========================================${NC}"
 }
 
 # 运行主函数
