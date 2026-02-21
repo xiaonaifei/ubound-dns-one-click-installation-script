@@ -1,153 +1,686 @@
 #!/bin/bash
 
-# 修复无效软件源并安装最新BBR内核脚本
-# 适用于 Ubuntu/Debian 系统
+# ===========================================
+# 服务器内核升级与BBR优化脚本
+# 支持 Ubuntu/Debian/CentOS/RHEL 系统
+# 自动检测并修复软件源问题
+# ===========================================
 
 set -e
 
 # 颜色输出设置
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m' # 无颜色
 
-# 打印状态信息
-info() {
-    echo -e "${GREEN}[信息] $*${NC}"
+# 日志函数
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $*"
 }
 
-warn() {
-    echo -e "${YELLOW}[警告] $*${NC}"
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
-error() {
-    echo -e "${RED}[错误] $*${NC}" >&2
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_step() {
+    echo -e "${PURPLE}[STEP]${NC} $*"
+}
+
+log_debug() {
+    echo -e "${CYAN}[DEBUG]${NC} $*"
+}
+
+# 显示横幅
+show_banner() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║                                                          ║${NC}"
+    echo -e "${BLUE}║    ${GREEN}服务器内核升级与BBR优化脚本${BLUE}                        ║${NC}"
+    echo -e "${BLUE}║    ${GREEN}支持 Ubuntu/Debian/CentOS${BLUE}                          ║${NC}"
+    echo -e "${BLUE}║                                                          ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 }
 
 # 检查root权限
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "此脚本必须以root权限运行"
+        log_error "此脚本必须以root权限运行"
+        exit 1
+    fi
+    log_info "权限检查通过"
+}
+
+# 检测系统信息
+detect_os() {
+    log_step "检测系统信息..."
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_NAME=$ID
+        OS_VERSION=$VERSION_ID
+        OS_PRETTY_NAME=$PRETTY_NAME
+        log_info "操作系统: $OS_PRETTY_NAME"
+        log_info "版本: $OS_VERSION"
+        
+        # 检测发行版系列
+        case $OS_NAME in
+            ubuntu|debian)
+                OS_FAMILY="debian"
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                OS_FAMILY="rhel"
+                ;;
+            *)
+                log_error "不支持的操作系统: $OS_NAME"
+                exit 1
+                ;;
+        esac
+    else
+        log_error "无法检测操作系统"
         exit 1
     fi
 }
 
-# 修复无效的rspamd软件源
-fix_rspamd_repo() {
-    info "检查并修复rspamd软件源..."
+# 检查当前内核信息
+check_current_kernel() {
+    log_step "检查当前内核信息..."
     
-    # 查找包含rspamd.com的源文件
-    local rspamd_files=$(grep -l "rspamd.com" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true)
+    # 当前内核版本
+    CURRENT_KERNEL=$(uname -r)
+    log_info "当前内核版本: $CURRENT_KERNEL"
     
-    if [ -n "$rspamd_files" ]; then
-        warn "发现rspamd软件源，正在禁用..."
-        for file in $rspamd_files; do
-            # 备份原文件
-            cp "$file" "${file}.bak"
-            # 注释掉rspamd源
-            sed -i '/rspamd.com/s/^/#/' "$file"
-            info "已禁用文件 $file 中的rspamd源"
-        done
+    # 内核架构
+    KERNEL_ARCH=$(uname -m)
+    log_info "系统架构: $KERNEL_ARCH"
+    
+    # 检查是否已启用BBR
+    TCP_CONGESTION=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    if [ "$TCP_CONGESTION" = "bbr" ]; then
+        log_info "BBR状态: 已启用"
+        BBR_ENABLED=true
     else
-        info "未找到rspamd软件源"
+        log_info "BBR状态: 未启用"
+        BBR_ENABLED=false
+    fi
+    
+    # 检查可用的最新内核
+    if [ "$OS_FAMILY" = "debian" ]; then
+        LATEST_KERNEL=$(apt-cache search linux-image | grep -E 'linux-image-[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 | awk '{print $1}' | sed 's/linux-image-//')
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        LATEST_KERNEL=$(yum list kernel --showduplicates | grep kernel | tail -1 | awk '{print $2}')
+    fi
+    
+    if [ -n "$LATEST_KERNEL" ]; then
+        log_info "可用最新内核: $LATEST_KERNEL"
     fi
 }
 
-# 为Ubuntu/Debian安装最新内核
-install_ubuntu_kernel() {
-    info "为Ubuntu/Debian安装最新内核..."
+# 备份重要文件
+backup_files() {
+    log_step "备份重要系统文件..."
     
-    # 先更新软件包列表
-    apt-get update
+    local BACKUP_DIR="/var/backup/kernel_upgrade_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
     
-    # 安装必要工具
-    apt-get install -y software-properties-common
+    # 备份关键文件
+    local files_to_backup=(
+        "/etc/apt/sources.list"
+        "/etc/apt/sources.list.d/"
+        "/etc/yum.repos.d/"
+        "/etc/sysctl.conf"
+        "/etc/default/grub"
+        "/boot/grub/grub.cfg"
+    )
     
-    # 添加官方内核PPA
-    add-apt-repository -y ppa:canonical-kernel-team/ppa
+    for file in "${files_to_backup[@]}"; do
+        if [ -e "$file" ]; then
+            if [ -d "$file" ]; then
+                cp -r "$file" "$BACKUP_DIR/"
+            else
+                cp "$file" "$BACKUP_DIR/"
+            fi
+            log_debug "已备份: $file"
+        fi
+    done
     
-    # 再次更新
-    apt-get update
+    # 备份当前内核配置
+    if [ -f "/boot/config-$CURRENT_KERNEL" ]; then
+        cp "/boot/config-$CURRENT_KERNEL" "$BACKUP_DIR/"
+    fi
+    
+    log_info "系统文件已备份到: $BACKUP_DIR"
+    echo "$BACKUP_DIR" > /tmp/kernel_backup_dir
+}
+
+# 修复软件源（Debian/Ubuntu）
+fix_debian_sources() {
+    log_step "修复 Debian/Ubuntu 软件源..."
+    
+    # 备份源列表
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak
+    
+    # 禁用有问题的第三方源
+    local problematic_repos=(
+        "rspamd.com"
+        "downloads.mariadb.org"
+        "repo.mysql.com"
+        "packages.elastic.co"
+        "artifacts.elastic.co"
+    )
+    
+    for repo in "${problematic_repos[@]}"; do
+        if grep -r "$repo" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+            log_warn "发现可能的问题源: $repo"
+            # 注释掉包含该源的配置行
+            sed -i "/$repo/s/^/#/" /etc/apt/sources.list 2>/dev/null || true
+            find /etc/apt/sources.list.d/ -name "*.list" -exec sed -i "/$repo/s/^/#/" {} \; 2>/dev/null || true
+        fi
+    done
+    
+    # 添加官方源（如果需要）
+    if ! grep -q "archive.ubuntu.com\|deb.debian.org" /etc/apt/sources.list; then
+        log_warn "未检测到官方源，将添加官方源..."
+        
+        if [ "$OS_NAME" = "ubuntu" ]; then
+            cat > /etc/apt/sources.list << 'EOF'
+# Ubuntu 官方源
+deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -cs) main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -cs)-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -cs)-security main restricted universe multiverse
+EOF
+        elif [ "$OS_NAME" = "debian" ]; then
+            cat > /etc/apt/sources.list << 'EOF'
+# Debian 官方源
+deb http://deb.debian.org/debian $(lsb_release -cs) main contrib non-free
+deb http://deb.debian.org/debian $(lsb_release -cs)-updates main contrib non-free
+deb http://security.debian.org/debian-security $(lsb_release -cs)-security main contrib non-free
+EOF
+        fi
+    fi
+    
+    log_info "软件源修复完成"
+}
+
+# 修复软件源（RHEL/CentOS）
+fix_rhel_sources() {
+    log_step "修复 RHEL/CentOS 软件源..."
+    
+    # 备份所有repo文件
+    cp -r /etc/yum.repos.d/ /etc/yum.repos.d.backup/
+    
+    # 禁用可能有问题的第三方源
+    local problematic_repos=(
+        "epel-testing"
+        "remi-php-test"
+        "mariadb"
+        "mongodb"
+        "nginx"
+    )
+    
+    for repo in "${problematic_repos[@]}"; do
+        if [ -f "/etc/yum.repos.d/${repo}.repo" ]; then
+            log_warn "禁用可能的问题源: $repo"
+            mv "/etc/yum.repos.d/${repo}.repo" "/etc/yum.repos.d/${repo}.repo.disabled"
+        fi
+    done
+    
+    # 确保基础源可用
+    if [ ! -f "/etc/yum.repos.d/CentOS-Base.repo" ] && [ ! -f "/etc/yum.repos.d/redhat.repo" ]; then
+        log_warn "未检测到基础源，将添加CentOS官方源..."
+        
+        if [ "$OS_NAME" = "centos" ]; then
+            cat > /etc/yum.repos.d/CentOS-Base.repo << 'EOF'
+# CentOS-Base.repo
+[base]
+name=CentOS-$releasever - Base
+baseurl=http://mirror.centos.org/centos/$releasever/os/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+
+[updates]
+name=CentOS-$releasever - Updates
+baseurl=http://mirror.centos.org/centos/$releasever/updates/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+
+[extras]
+name=CentOS-$releasever - Extras
+baseurl=http://mirror.centos.org/centos/$releasever/extras/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+EOF
+        fi
+    fi
+    
+    log_info "软件源修复完成"
+}
+
+# 更新软件包列表
+update_package_lists() {
+    log_step "更新软件包列表..."
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        apt-get update
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        yum clean all
+        yum makecache
+    fi
+    
+    log_info "软件包列表更新完成"
+}
+
+# 安装必要工具
+install_tools() {
+    log_step "安装必要工具..."
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        apt-get install -y curl wget gnupg software-properties-common
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        yum install -y curl wget epel-release
+    fi
+    
+    log_info "必要工具安装完成"
+}
+
+# 安装最新内核（Ubuntu/Debian）
+install_debian_kernel() {
+    log_step "安装最新内核 (Ubuntu/Debian)..."
+    
+    # 添加官方内核PPA（Ubuntu）
+    if [ "$OS_NAME" = "ubuntu" ]; then
+        add-apt-repository -y ppa:canonical-kernel-team/ppa
+        apt-get update
+    fi
     
     # 安装最新内核
     apt-get install -y --install-recommends linux-generic-hwe-$(lsb_release -rs)
+    
+    # 安装头文件和开发包
+    apt-get install -y linux-headers-$(uname -r)
+    
+    log_info "内核安装完成"
+}
+
+# 安装最新内核（CentOS/RHEL）
+install_rhel_kernel() {
+    log_step "安装最新内核 (CentOS/RHEL)..."
+    
+    # 启用ELRepo仓库（提供最新内核）
+    rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
+    
+    if [ "$OS_NAME" = "centos" ] || [ "$OS_NAME" = "rocky" ] || [ "$OS_NAME" = "almalinux" ]; then
+        yum install -y https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm
+        
+        # 安装主线内核
+        yum --enablerepo=elrepo-kernel install -y kernel-ml
+        
+        # 安装头文件
+        yum --enablerepo=elrepo-kernel install -y kernel-ml-headers kernel-ml-devel
+    elif [ "$OS_NAME" = "fedora" ]; then
+        # Fedora通常已经有最新内核
+        yum update -y kernel kernel-core kernel-modules
+    fi
+    
+    log_info "内核安装完成"
+}
+
+# 配置GRUB
+configure_grub() {
+    log_step "配置GRUB引导..."
+    
+    # 更新GRUB配置
+    if [ -f /etc/default/grub ]; then
+        # 备份GRUB配置
+        cp /etc/default/grub /etc/default/grub.bak
+        
+        # 修改GRUB配置，启用新内核
+        sed -i 's/GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' /etc/default/grub
+        
+        # 对于物理服务器，可以设置较短的超时时间
+        sed -i 's/GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
+    fi
+    
+    # 更新GRUB
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg
+    fi
+    
+    log_info "GRUB配置更新完成"
 }
 
 # 配置BBR
 configure_bbr() {
-    info "配置BBR..."
+    log_step "配置BBR拥塞控制算法..."
     
-    # 检查并添加sysctl配置
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    # 检查sysctl配置
+    if [ ! -f /etc/sysctl.conf ]; then
+        touch /etc/sysctl.conf
     fi
     
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
+    # 备份sysctl配置
+    cp /etc/sysctl.conf /etc/sysctl.conf.bak
+    
+    # 添加BBR配置
+    cat >> /etc/sysctl.conf << 'EOF'
+
+# BBR 拥塞控制优化
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# 网络参数优化
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# 增加TCP缓冲区大小
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+EOF
     
     # 应用配置
     sysctl -p
+    
+    log_info "BBR配置完成"
 }
 
-# 设置GRUB启动项
-set_grub() {
-    info "更新GRUB配置..."
+# 配置内核参数优化
+configure_kernel_params() {
+    log_step "优化内核参数..."
     
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub
-    fi
+    # 创建自定义内核参数文件
+    cat > /etc/sysctl.d/99-optimize.conf << 'EOF'
+# 系统性能优化
+fs.file-max = 6553500
+fs.nr_open = 1048576
+
+# 内存管理优化
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.overcommit_memory = 1
+vm.overcommit_ratio = 80
+
+# 网络连接优化
+net.ipv4.tcp_max_syn_backlog = 65536
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_recycle = 0
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+
+# 文件系统优化
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 1024
+
+# 其他优化
+kernel.pid_max = 4194304
+kernel.threads-max = 2097152
+EOF
     
-    # 设置最新内核为默认启动项
-    if command -v grub-set-default >/dev/null 2>&1; then
-        grub-set-default 0
-    fi
+    # 应用配置
+    sysctl -p /etc/sysctl.d/99-optimize.conf
+    
+    # 调整文件描述符限制
+    cat > /etc/security/limits.d/99-nofile.conf << 'EOF'
+* soft nofile 655350
+* hard nofile 655350
+root soft nofile 655350
+root hard nofile 655350
+EOF
+    
+    log_info "内核参数优化完成"
 }
 
-# 验证BBR状态
-verify_bbr() {
-    info "验证BBR状态..."
+# 验证安装结果
+verify_installation() {
+    log_step "验证安装结果..."
     
-    # 检查当前拥塞控制算法
-    CC_ALGORITHM=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-    if [ "$CC_ALGORITHM" = "bbr" ]; then
-        info "BBR 已成功启用"
+    echo -e "\n${CYAN}=== 内核信息 ===${NC}"
+    
+    # 检查新内核是否安装成功
+    NEW_KERNEL=$(uname -r)
+    log_info "当前运行内核: $NEW_KERNEL"
+    
+    # 检查可用的内核列表
+    if [ "$OS_FAMILY" = "debian" ]; then
+        dpkg -l | grep linux-image | awk '{print $2}'
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        rpm -qa | grep kernel
+    fi
+    
+    echo -e "\n${CYAN}=== BBR状态 ===${NC}"
+    
+    # 检查BBR是否启用
+    TCP_CONGESTION=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    if [ "$TCP_CONGESTION" = "bbr" ]; then
+        log_info "✅ BBR已成功启用"
     else
-        warn "BBR 未启用，当前算法: $CC_ALGORITHM"
+        log_error "❌ BBR未启用，当前算法: $TCP_CONGESTION"
     fi
     
-    # 检查内核版本
-    KERNEL_VERSION=$(uname -r)
-    info "当前内核版本: $KERNEL_VERSION"
+    # 检查队列规则
+    QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
+    log_info "队列规则: $QDISC"
+    
+    echo -e "\n${CYAN}=== 系统参数 ===${NC}"
+    
+    # 检查关键参数
+    log_info "文件描述符限制:"
+    ulimit -n
+    
+    log_info "内存参数:"
+    sysctl vm.swappiness vm.vfs_cache_pressure
+    
+    log_info "网络参数:"
+    sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+    
+    echo -e "\n${CYAN}=== 性能测试 ===${NC}"
+    
+    # 简单网络测试
+    if command -v ping >/dev/null 2>&1; then
+        log_info "网络连通性测试:"
+        ping -c 2 8.8.8.8 | grep -E "time=|packets"
+    fi
+    
+    log_info "安装验证完成"
+}
+
+# 清理旧内核
+clean_old_kernels() {
+    log_step "清理旧内核..."
+    
+    # 获取当前运行的内核
+    CURRENT_KERNEL=$(uname -r)
+    
+    if [ "$OS_FAMILY" = "debian" ]; then
+        # 列出所有已安装的内核
+        KERNELS=$(dpkg -l | grep 'linux-image-[0-9]' | grep -v "linux-image-$CURRENT_KERNEL" | awk '{print $2}')
+        
+        for kernel in $KERNELS; do
+            log_info "删除旧内核: $kernel"
+            apt-get purge -y "$kernel"
+        done
+        
+        # 清理无用的包
+        apt-get autoremove -y
+        apt-get autoclean -y
+        
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        # 保留最新的2个内核
+        yum install -y yum-utils
+        package-cleanup --oldkernels --count=2 -y
+    fi
+    
+    log_info "旧内核清理完成"
+}
+
+# 显示安装摘要
+show_summary() {
+    log_step "安装摘要"
+    
+    echo -e "\n${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}         内核升级完成               ${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    
+    echo -e "${GREEN}系统信息:${NC}"
+    echo "  操作系统: $OS_PRETTY_NAME"
+    echo "  版本: $OS_VERSION"
+    echo "  架构: $KERNEL_ARCH"
+    
+    echo -e "\n${GREEN}内核信息:${NC}"
+    echo "  当前内核: $(uname -r)"
+    echo "  BBR状态: $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')"
+    
+    echo -e "\n${GREEN}优化配置:${NC}"
+    echo "  ✅ BBR拥塞控制"
+    echo "  ✅ 网络参数优化"
+    echo "  ✅ 内核参数优化"
+    echo "  ✅ 文件描述符调整"
+    
+    echo -e "\n${GREEN}文件备份:${NC}"
+    if [ -f /tmp/kernel_backup_dir ]; then
+        BACKUP_DIR=$(cat /tmp/kernel_backup_dir)
+        echo "  备份目录: $BACKUP_DIR"
+    fi
+    
+    echo -e "\n${YELLOW}重要提示:${NC}"
+    echo "  1. 系统需要重启以使用新内核"
+    echo "  2. 重启后验证BBR是否生效"
+    echo "  3. 备份文件位于: $BACKUP_DIR"
+    
+    echo -e "\n${CYAN}管理命令:${NC}"
+    echo "  查看内核: uname -r"
+    echo "  检查BBR: sysctl net.ipv4.tcp_congestion_control"
+    echo "  系统重启: reboot"
+    echo "  查看日志: journalctl -u systemd-modules-load"
+}
+
+# 询问重启
+ask_reboot() {
+    echo -e "\n${YELLOW}系统需要重启以应用新内核${NC}"
+    read -p "是否立即重启系统? (y/N): " -n 1 -r
+    echo
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_warn "系统将在10秒后重启..."
+        log_warn "按 Ctrl+C 取消重启"
+        
+        for i in {10..1}; do
+            echo -ne "倒计时: $i 秒\033[0K\r"
+            sleep 1
+        done
+        
+        log_info "正在重启系统..."
+        reboot
+    else
+        log_info "请稍后手动重启系统"
+        log_info "重启命令: reboot"
+    fi
+}
+
+# 错误处理
+handle_error() {
+    local exit_code=$?
+    local line_number=$1
+    
+    log_error "脚本在行 $line_number 执行失败，退出码: $exit_code"
+    
+    if [ -f /tmp/kernel_backup_dir ]; then
+        BACKUP_DIR=$(cat /tmp/kernel_backup_dir)
+        log_warn "备份文件位于: $BACKUP_DIR"
+        log_warn "可以从备份恢复系统配置"
+    fi
+    
+    exit $exit_code
 }
 
 # 主函数
 main() {
-    info "开始修复软件源并安装最新BBR内核..."
-    check_root
+    # 设置错误处理
+    trap 'handle_error $LINENO' ERR
     
-    # 检查系统是否为Ubuntu/Debian
-    if ! grep -q "Ubuntu\|Debian" /etc/issue; then
-        error "此脚本仅适用于Ubuntu/Debian系统"
-        exit 1
+    # 显示横幅
+    show_banner
+    
+    # 初始检查
+    check_root
+    detect_os
+    
+    # 显示系统信息
+    log_info "开始内核升级过程..."
+    log_info "操作系统: $OS_PRETTY_NAME"
+    log_info "系统家族: $OS_FAMILY"
+    
+    # 检查当前内核
+    check_current_kernel
+    
+    # 备份重要文件
+    backup_files
+    
+    # 修复软件源
+    if [ "$OS_FAMILY" = "debian" ]; then
+        fix_debian_sources
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        fix_rhel_sources
     fi
     
-    fix_rspamd_repo
-    install_ubuntu_kernel
-    set_grub
+    # 更新包列表
+    update_package_lists
+    
+    # 安装必要工具
+    install_tools
+    
+    # 安装最新内核
+    if [ "$OS_FAMILY" = "debian" ]; then
+        install_debian_kernel
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        install_rhel_kernel
+    fi
+    
+    # 配置GRUB
+    configure_grub
+    
+    # 配置BBR
     configure_bbr
     
-    info "安装完成！需要重启系统以使更改生效。"
-    read -p "是否立即重启系统? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        warn "系统即将重启..."
-        sleep 3
-        reboot
-    else
-        info "请稍后手动重启系统以完成安装"
-    fi
+    # 配置内核参数
+    configure_kernel_params
+    
+    # 清理旧内核
+    clean_old_kernels
+    
+    # 验证安装
+    verify_installation
+    
+    # 显示摘要
+    show_summary
+    
+    # 询问重启
+    ask_reboot
+    
+    log_info "内核升级脚本执行完成"
 }
 
-# 执行主函数
+# 运行主函数
 main "$@"
