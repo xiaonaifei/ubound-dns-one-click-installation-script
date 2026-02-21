@@ -1,256 +1,254 @@
 #!/bin/bash
+# Unbound DNS 服务器一键安装与管理工具箱
+# 仓库: https://github.com/xiaonaifei/ubound-dns-one-click-installation-script
+# 功能整合: kill-53, dns-Unbound, bbr-update, bbr-core-update,
+#           CloudflareSpeedTest-Install.sh, Chinese-font-installation.sh,
+#           以及附加的中文语言环境设置和内核优化
+
+set -e
 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# 显示菜单函数
-show_menu() {
-    clear
-    echo -e "${GREEN}=========================================${NC}"
-    echo -e "${GREEN}           系统优化脚本菜单${NC}"
-    echo -e "${GREEN}=========================================${NC}"
-    echo -e "${BLUE}1.${NC} 安装递归DNS (Unbound)"
-    echo -e "${RED}2. 53端口清理 (谨慎使用!)${NC}"
-    echo -e "${BLUE}3.${NC} BBR参数暴力调整"
-    echo -e "${BLUE}4.${NC} BBR内核升级"
-    echo -e "${PURPLE}5.${NC} 一键执行所有优化"
-    echo -e "${CYAN}6.${NC} 安装Unbound (Yeti DNS)"
-    echo -e "${CYAN}7.${NC} 安装中文语言包"
-    echo -e "${BLUE}0.${NC} 退出脚本"
-    echo -e "${GREEN}=========================================${NC}"
-    echo -e "${YELLOW}提示: 红色选项为高风险操作，请谨慎使用!${NC}"
-}
-
-# 安装递归DNS
-install_unbound_dns() {
-    echo -e "${YELLOW}开始安装递归DNS (Unbound)...${NC}"
-    bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/dns-Unbound)
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}递归DNS安装完成!${NC}"
-    else
-        echo -e "${RED}递归DNS安装失败!${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# 清理53端口
-clean_port_53() {
-    echo -e "${RED}=========================================${NC}"
-    echo -e "${RED}           警告: 高风险操作!${NC}"
-    echo -e "${RED}=========================================${NC}"
-    echo -e "${YELLOW}此操作将强制清理占用53端口的进程!${NC}"
-    echo -e "${YELLOW}这可能会影响正在运行的DNS服务。${NC}"
-    echo -e "${YELLOW}请确保你知道此操作的后果!${NC}"
-    echo -e "${RED}=========================================${NC}"
-    
-    read -p "确定要继续吗? (输入 'YES' 确认): " confirm
-    
-    if [[ $confirm == "YES" ]]; then
-        echo -e "${YELLOW}开始清理53端口...${NC}"
-        bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/kill-53)
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}53端口清理完成!${NC}"
-        else
-            echo -e "${RED}53端口清理失败!${NC}"
-        fi
-    else
-        echo -e "${YELLOW}已取消53端口清理操作。${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# 调整BBR参数
-adjust_bbr() {
-    echo -e "${YELLOW}开始调整BBR参数...${NC}"
-    bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/bbr-update)
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}BBR参数调整完成!${NC}"
-    else
-        echo -e "${RED}BBR参数调整失败!${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# BBR内核升级
-upgrade_bbr_kernel() {
-    echo -e "${YELLOW}开始BBR内核升级...${NC}"
-    echo -e "${YELLOW}注意: 内核升级需要重启系统才能生效${NC}"
-    
-    bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/bbr-core-update)
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}BBR内核升级完成!${NC}"
-        echo -e "${YELLOW}请重启系统使新内核生效: sudo reboot${NC}"
-    else
-        echo -e "${RED}BBR内核升级失败!${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# 安装Unbound (Yeti DNS)
-install_unbound_yeti() {
-    echo -e "${YELLOW}开始安装Unbound (Yeti DNS)...${NC}"
-    echo -e "${CYAN}此脚本将安装配置使用Yeti DNS根服务器的Unbound${NC}"
-    
-    # 下载并执行Yeti DNS安装脚本
-    bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/Yetidns/Unbound-Yeti%20DNS.sh)
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Unbound (Yeti DNS) 安装完成!${NC}"
-    else
-        echo -e "${RED}Unbound (Yeti DNS) 安装失败!${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# 安装中文语言包
-install_chinese_language_pack() {
-    echo -e "${YELLOW}开始安装中文语言包...${NC}"
-    
-    # 下载并执行中文语言包安装脚本
-    bash <(curl -fsSL https://raw.githubusercontent.com/wuxingzhidi/ubound-dns-one-click-installation-script/main/Yetidns/cn.sh)
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}中文语言包安装完成!${NC}"
-    else
-        echo -e "${RED}中文语言包安装失败!${NC}"
-    fi
-    read -p "按回车键继续..."
-}
-
-# 一键执行所有优化
-all_in_one() {
-    echo -e "${YELLOW}开始一键执行所有优化...${NC}"
-    echo -e "${PURPLE}注意: 此操作将按顺序执行所有优化项目${NC}"
-    
-    # 安装递归DNS
-    echo -e "${BLUE}[1/4] 安装递归DNS...${NC}"
-    install_unbound_dns
-    echo
-    
-    # 清理53端口 (需要确认)
-    echo -e "${RED}[2/4] 清理53端口...${NC}"
-    clean_port_53
-    echo
-    
-    # 调整BBR参数
-    echo -e "${BLUE}[3/4] 调整BBR参数...${NC}"
-    adjust_bbr
-    echo
-    
-    # BBR内核升级
-    echo -e "${BLUE}[4/4] BBR内核升级...${NC}"
-    upgrade_bbr_kernel
-    echo
-    
-    echo -e "${GREEN}所有优化操作完成!${NC}"
-    echo -e "${YELLOW}请注意: 内核升级后需要重启系统才能生效${NC}"
-    read -p "按回车键继续..."
-}
-
-# 检查curl是否安装
-check_dependencies() {
-    if ! command -v curl &> /dev/null; then
-        echo -e "${RED}错误: 需要安装curl工具${NC}"
-        echo "请运行以下命令安装:"
-        echo "Ubuntu/Debian: sudo apt update && sudo apt install -y curl"
-        echo "CentOS/RHEL: sudo yum install -y curl"
+# 检查 root 权限
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}请以 root 用户执行此脚本${NC}"
         exit 1
     fi
 }
 
-# 显示系统信息
-show_system_info() {
-    echo -e "${CYAN}系统信息:${NC}"
-    echo -e "操作系统: $(lsb_release -d 2>/dev/null | cut -f2 || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2)"
-    echo -e "内核版本: $(uname -r)"
-    echo -e "当前时间: $(date)"
+# 获取脚本所在目录的绝对路径（仓库根目录）
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+# 显示主菜单
+show_menu() {
+    clear
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}        Unbound DNS 服务器一键管理工具箱        ${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW} 脚本仓库: ${SCRIPT_DIR}${NC}"
     echo ""
+    echo " 1) 清理 53 端口占用 (kill-53)"
+    echo " 2) 安装/配置 Unbound DNS 服务器 (dns-Unbound)"
+    echo " 3) 更新 BBR 内核 (bbr-core-update)"
+    echo " 4) 调整 BBR 参数 (bbr-update)"
+    echo " 5) 安装 Cloudflare 速度测试工具 (CloudflareSpeedTest-Install.sh)"
+    echo " 6) 安装中文字体/语言包 (Chinese-font-installation.sh)"
+    echo " 7) 设置系统中文语言环境 (locale 配置)"
+    echo " 8) 应用系统内核优化参数 (sysctl 调优)"
+    echo " 9) 查看当前系统状态 (端口、内核、语言)"
+    echo "10) 一键执行推荐设置 (DNS + BBR内核 + 优化)"
+    echo " 0) 退出"
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    echo -n "请输入选项 [0-10]: "
 }
 
-# 主函数
-main() {
-    # 检查依赖
-    check_dependencies
-    
-    # 显示系统信息
-    show_system_info
-    
-    while true; do
-        show_menu
-        read -p "请选择操作 (0-7): " choice
-        
-        case $choice in
-            1)
-                install_unbound_dns
-                ;;
-            2)
-                clean_port_53
-                ;;
-            3)
-                adjust_bbr
-                ;;
-            4)
-                upgrade_bbr_kernel
-                ;;
-            5)
-                all_in_one
-                ;;
-            6)
-                install_unbound_yeti
-                ;;
-            7)
-                install_chinese_language_pack
-                ;;
-            0)
-                echo -e "${GREEN}感谢使用，再见!${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}无效选择，请重新输入!${NC}"
-                read -p "按回车键继续..."
-                ;;
-        esac
-    done
+# 执行子脚本，处理文件存在性与权限
+run_script() {
+    local script_name="$1"
+    local script_path="${SCRIPT_DIR}/${script_name}"
+
+    if [ ! -f "$script_path" ]; then
+        echo -e "${RED}错误: 未找到脚本 ${script_name}${NC}"
+        echo -e "请确保文件存在于仓库目录: ${SCRIPT_DIR}"
+        read -p "按 Enter 键返回菜单..."
+        return 1
+    fi
+
+    if [ ! -x "$script_path" ]; then
+        echo -e "${YELLOW}脚本 ${script_name} 缺少执行权限，正在添加...${NC}"
+        chmod +x "$script_path"
+    fi
+
+    echo -e "${GREEN}正在执行: ${script_name} ...${NC}"
+    "$script_path"
+    local exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✅ ${script_name} 执行完成。${NC}"
+    else
+        echo -e "${RED}❌ ${script_name} 执行失败，退出码: ${exit_code}${NC}"
+    fi
+    echo ""
+    read -p "按 Enter 键返回菜单..."
 }
 
-# 脚本说明
-echo -e "${GREEN}系统优化脚本 v2.1${NC}"
-echo -e "${YELLOW}作者: 基于 wuxingzhidi 的脚本${NC}"
-echo -e "${BLUE}功能说明:${NC}"
-echo -e "1. 递归DNS安装 - 安装Unbound DNS解析器"
-echo -e "${RED}2. 53端口清理 - 清理占用DNS端口的进程${NC}"
-echo -e "3. BBR优化 - 调整TCP BBR参数提升网络性能"
-echo -e "4. BBR内核升级 - 升级内核以获得更好的BBR支持"
-echo -e "5. 一键执行所有优化 - 按顺序执行上述优化"
-echo -e "6. 安装Unbound (Yeti DNS) - 使用Yeti DNS根服务器的Unbound"
-echo -e "7. 安装中文语言包 - 安装系统中文语言支持"
-echo ""
+# 设置中文语言环境（基于之前讨论）
+setup_chinese_locale() {
+    echo -e "${YELLOW}正在配置系统中文语言环境...${NC}"
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    else
+        echo -e "${RED}无法识别操作系统${NC}"
+        return 1
+    fi
 
-# 显示警告信息
-echo -e "${RED}=========================================${NC}"
-echo -e "${RED}               重要警告!${NC}"
-echo -e "${RED}=========================================${NC}"
-echo -e "${YELLOW}1. 53端口清理是高风险操作，可能影响系统稳定性${NC}"
-echo -e "${YELLOW}2. 内核升级需要重启系统才能生效${NC}"
-echo -e "${YELLOW}3. 建议在测试环境中先验证效果${NC}"
-echo -e "${YELLOW}4. 生产环境使用前请做好备份${NC}"
-echo -e "${RED}=========================================${NC}"
-echo ""
+    case $OS in
+        ubuntu|debian)
+            apt update
+            apt install -y language-pack-zh-hans
+            locale-gen zh_CN.UTF-8
+            echo "LANG=zh_CN.UTF-8" > /etc/default/locale
+            echo "LANGUAGE=zh_CN:zh" >> /etc/default/locale
+            echo "LC_ALL=zh_CN.UTF-8" >> /etc/default/locale
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            if command -v dnf &> /dev/null; then
+                dnf install -y glibc-langpack-zh
+            else
+                yum install -y glibc-langpack-zh
+            fi
+            localectl set-locale LANG=zh_CN.UTF-8
+            ;;
+        *)
+            echo -e "${RED}不支持的操作系统: $OS${NC}"
+            return 1
+            ;;
+    esac
 
-read -p "是否继续? (输入 'continue' 确认): " start_confirm
-if [[ $start_confirm == "continue" ]]; then
-    main
-else
-    echo -e "${YELLOW}已取消执行。${NC}"
-    exit 0
-fi
+    echo -e "${GREEN}中文语言环境配置完成，请重新登录或重启系统生效。${NC}"
+    read -p "按 Enter 键返回菜单..."
+}
+
+# 应用 sysctl 优化（基于之前讨论的优化参数）
+apply_sysctl_optimizations() {
+    echo -e "${YELLOW}即将应用系统内核参数优化...${NC}"
+    
+    # 自动备份
+    local bk_file="/etc/sysctl.conf.bk_$(date +%Y%m%d_%H%M%S)"
+    cp /etc/sysctl.conf "$bk_file"
+    echo -e "已备份原配置至: ${bk_file}"
+
+    # 写入优化参数（可根据需要调整）
+    cat >> /etc/sysctl.conf <<EOF
+
+# 由 dns-toolkit.sh 添加的优化参数 $(date)
+# 网络核心
+net.core.default_qdisc = cake
+net.core.netdev_max_backlog = 2931
+net.core.rmem_max = 19660800
+net.core.wmem_max = 19660800
+net.core.somaxconn = 1465
+net.core.optmem_max = 65536
+
+# TCP 优化
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_rmem = 8192 87380 19660800
+net.ipv4.tcp_wmem = 8192 65536 19660800
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_window_scaling = 1
+
+# 内存管理
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.panic_on_oom = 1
+vm.overcommit_memory = 1
+
+# 内核及安全
+kernel.panic = 1
+kernel.sysrq = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.rp_filter = 1
+EOF
+
+    sysctl -p
+    echo -e "${GREEN}内核参数优化已应用。${NC}"
+    read -p "按 Enter 键返回菜单..."
+}
+
+# 查看系统状态
+show_system_status() {
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                系统状态信息                ${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    
+    echo -e "${YELLOW}1. 当前监听 53 端口的进程:${NC}"
+    ss -tulpn | grep -E ':(53)\s' || echo "无进程监听 53 端口"
+    
+    echo -e "\n${YELLOW}2. 当前内核版本:${NC}"
+    uname -r
+    
+    echo -e "\n${YELLOW}3. 当前拥塞控制算法:${NC}"
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null || echo "未配置"
+    
+    echo -e "\n${YELLOW}4. 当前语言环境:${NC}"
+    locale | grep LANG
+    
+    echo -e "\n${YELLOW}5. 系统发行版:${NC}"
+    cat /etc/os-release | grep -E "^(NAME|VERSION)=" || echo "未知"
+    
+    echo -e "${BLUE}══════════════════════════════════════════════${NC}"
+    read -p "按 Enter 键返回菜单..."
+}
+
+# 一键执行推荐设置
+onekey_install() {
+    echo -e "${YELLOW}即将执行一键推荐安装/配置...${NC}"
+    echo -e "包含: 清理53端口 + 安装Unbound + 更新BBR内核 + 应用优化"
+    echo -e "${RED}此操作可能需要较长时间，请谨慎！${NC}"
+    read -p "确认继续？ (y/n): " confirm
+    if [[ ! "$confirm" =~ ^[yY](es)?$ ]]; then
+        echo "已取消。"
+        read -p "按 Enter 键返回菜单..."
+        return
+    fi
+
+    # 步骤1: 清理53端口
+    run_script "kill-53"
+    
+    # 步骤2: 安装Unbound DNS
+    run_script "dns-Unbound"
+    
+    # 步骤3: 更新BBR内核
+    if [ -f "${SCRIPT_DIR}/bbr-core-update" ]; then
+        run_script "bbr-core-update"
+    else
+        echo -e "${YELLOW}未找到 bbr-core-update，尝试 bbr-update...${NC}"
+        run_script "bbr-update"
+    fi
+    
+    # 步骤4: 应用内核优化
+    apply_sysctl_optimizations
+    
+    echo -e "${GREEN}一键推荐安装流程执行完毕。${NC}"
+    read -p "按 Enter 键返回菜单..."
+}
+
+# 主循环
+check_root
+while true; do
+    show_menu
+    read choice
+    case $choice in
+        1) run_script "kill-53" ;;
+        2) run_script "dns-Unbound" ;;
+        3) run_script "bbr-core-update" ;;
+        4) run_script "bbr-update" ;;
+        5) run_script "CloudflareSpeedTest-Install.sh" ;;
+        6) run_script "Chinese-font-installation.sh" ;;
+        7) setup_chinese_locale ;;
+        8) apply_sysctl_optimizations ;;
+        9) show_system_status ;;
+        10) onekey_install ;;
+        0)
+            echo -e "${GREEN}感谢使用，再见！${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}无效选项，请重新输入。${NC}"
+            read -p "按 Enter 键继续..."
+            ;;
+    esac
+done
